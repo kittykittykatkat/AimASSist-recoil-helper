@@ -262,10 +262,14 @@ DEFAULT_STATE = {
 # ---------------------------------------------------------------------------
 # DARK TITLEBAR
 # ---------------------------------------------------------------------------
-def _apply_dark_titlebar_worker():
+def _apply_dark_titlebar_worker(stop_event=None):
     if not sys.platform.startswith('win'): return
-    time.sleep(0.3)
+    if stop_event:
+        if stop_event.wait(0.3): return
+    else:
+        time.sleep(0.3)
     for _ in range(30):
+        if stop_event and stop_event.is_set(): return
         try:
             hwnd = ctypes.windll.user32.FindWindowW(None, "AimASSist Control Workspace")
             if hwnd:
@@ -276,14 +280,17 @@ def _apply_dark_titlebar_worker():
                 logging.info("Dark title bar applied.")
                 return
         except Exception: pass
-        time.sleep(0.1)
+        if stop_event:
+            if stop_event.wait(0.1): return
+        else:
+            time.sleep(0.1)
 
 # ---------------------------------------------------------------------------
 # PC KEYBOARD PANIC LISTENER
 # ---------------------------------------------------------------------------
-def main_pc_keyboard_listener_worker():
+def main_pc_keyboard_listener_worker(stop_event=None):
     latch = False
-    while True:
+    while not stop_event or not stop_event.is_set():
         try:
             with STATE_LOCK:
                 target = DEFAULT_STATE["toggle_key"].lower()
@@ -299,7 +306,10 @@ def main_pc_keyboard_listener_worker():
             else:
                 latch = False
         except Exception: pass
-        time.sleep(0.01)
+        if stop_event:
+            stop_event.wait(0.01)
+        else:
+            time.sleep(0.01)
 
 def callback_update_hotkey(sender, app_data):
     with STATE_LOCK: DEFAULT_STATE["toggle_key"] = app_data
@@ -321,6 +331,24 @@ def get_interpolated_velocity(elapsed_time, sorted_nodes):
             t = (elapsed_time - a[0]) / d
             return a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t
     return 0.0, 0.0
+
+def select_runtime_mode(state, recoil_triggered, burst_triggered, ads, burst_in_progress=False):
+    """Select output from enabled modules independently of the visible UI tab."""
+    recoil_ready = (
+        state["recoil_module_enabled"]
+        and recoil_triggered
+        and (not state["recoil_require_ads"] or ads)
+    )
+    burst_ready = (
+        state["burst_module_enabled"]
+        and burst_triggered
+        and (not state["burst_require_ads"] or ads)
+    )
+    if recoil_ready:
+        return "Recoil", True
+    if burst_ready or (state["burst_module_enabled"] and burst_in_progress):
+        return "Burst", burst_ready
+    return "None", False
 
 # ---------------------------------------------------------------------------
 # CONFIG I/O
@@ -428,7 +456,7 @@ def precision_sleep(duration):
 # ---------------------------------------------------------------------------
 # HARDWARE ENGINE
 # ---------------------------------------------------------------------------
-def hardware_consumer_engine(data_mailbox):
+def hardware_consumer_engine(data_mailbox, stop_event=None):
     rs = DEFAULT_STATE.copy()
 
     recoil_trigger_latch = False
@@ -458,7 +486,7 @@ def hardware_consumer_engine(data_mailbox):
         try: UI_UPDATE_QUEUE.put_nowait(("set_value", tag, value))
         except queue.Full: pass
 
-    while True:
+    while not stop_event or not stop_event.is_set():
         try:
             # Drain config updates (maxsize=16 — no silent drops on rapid changes)
             while True:
@@ -552,16 +580,9 @@ def hardware_consumer_engine(data_mailbox):
                 raw_b = b_phys; burst_toggled_on = False
             prev_b_phys = b_phys
 
-            is_firing   = False
-            active_mode = "None"
-            tab         = rs["active_tab"]
-
-            if tab == "Recoil" and rs["recoil_module_enabled"]:
-                active_mode = "Recoil"
-                if raw_r and (not rs["recoil_require_ads"] or ads): is_firing = True
-            elif tab == "Burst" and rs["burst_module_enabled"]:
-                active_mode = "Burst"
-                if raw_b and (not rs["burst_require_ads"] or ads): is_firing = True
+            active_mode, is_firing = select_runtime_mode(
+                rs, raw_r, raw_b, ads, in_burst_sequence
+            )
 
             if in_burst_sequence and rs["burst_require_ads"] and not ads:
                 in_burst_sequence = False; last_burst_finish = now
@@ -1080,6 +1101,51 @@ def callback_viewport_resize(sender, app_data):
         dpg.configure_item("shell", width=app_data[0]-15, height=app_data[1]-35)
 
 # ---------------------------------------------------------------------------
+# RUNTIME LIFECYCLE
+# ---------------------------------------------------------------------------
+WORKER_JOIN_TIMEOUT = 1.0
+
+def start_runtime_workers(stop_event):
+    """Start background workers and return handles for orderly shutdown."""
+    workers = []
+    if sys.platform.startswith('win'):
+        workers.append(threading.Thread(
+            target=_apply_dark_titlebar_worker,
+            args=(stop_event,),
+            name="dark-titlebar",
+            daemon=True,
+        ))
+    workers.extend([
+        threading.Thread(
+            target=main_pc_keyboard_listener_worker,
+            args=(stop_event,),
+            name="panic-listener",
+            daemon=True,
+        ),
+        threading.Thread(
+            target=hardware_consumer_engine,
+            args=(DATA_QUEUE, stop_event),
+            name="hardware-engine",
+            daemon=True,
+        ),
+    ])
+    for worker in workers:
+        worker.start()
+    return workers
+
+def shutdown_runtime(stop_event, workers):
+    """Stop workers before releasing the active hardware device."""
+    stop_event.set()
+    for worker in workers:
+        worker.join(timeout=WORKER_JOIN_TIMEOUT)
+        if worker.is_alive():
+            logging.warning(f"Worker did not stop cleanly: {worker.name}")
+    try:
+        DEVICE.disconnect()
+    except Exception as exc:
+        logging.error(f"Device disconnect failed: {exc}")
+
+# ---------------------------------------------------------------------------
 # UI BUILD
 # ---------------------------------------------------------------------------
 def build_tactical_surface():
@@ -1447,38 +1513,37 @@ def build_tactical_surface():
     dpg.setup_dearpygui()
     dpg.show_viewport()
 
-    if sys.platform.startswith('win'):
-        threading.Thread(target=_apply_dark_titlebar_worker, daemon=True).start()
-
     # ADD THIS LINE HERE TO ENGAGE THE PRIMARY WINDOW ENGINE:
     dpg.set_primary_window("shell", True)
 
-    threading.Thread(target=main_pc_keyboard_listener_worker, daemon=True).start()
-    threading.Thread(target=hardware_consumer_engine, args=(DATA_QUEUE,), daemon=True).start()
+    stop_event = threading.Event()
+    workers = start_runtime_workers(stop_event)
 
-    redraw_recoil_canvas()
-    _update_node_info()
-    redraw_burst_canvas()
+    try:
+        redraw_recoil_canvas()
+        _update_node_info()
+        redraw_burst_canvas()
 
-    # Apply the initial tab styling now that everything is built
-    ui_tab_navigation(None, None, "panel_recoil")
+        # Apply the initial tab styling now that everything is built
+        ui_tab_navigation(None, None, "panel_recoil")
 
-    while dpg.is_dearpygui_running():
-        dpg.render_dearpygui_frame()
-        # Drain deferred UI updates — all DPG writes from background threads land here
-        while True:
-            try:
-                msg = UI_UPDATE_QUEUE.get_nowait()
-                if msg[0] == "set_value":
-                    dpg.set_value(msg[1], msg[2])
-                elif msg[0] == "status":
-                    ok = msg[1]
-                    dpg.set_value("ui_status_text", "ONLINE" if ok else "PAUSED")
-                    dpg.configure_item("ui_status_text", color=(0, 255, 120) if ok else (239, 68, 68))
-            except queue.Empty:
-                break
-
-    dpg.destroy_context()
+        while dpg.is_dearpygui_running():
+            dpg.render_dearpygui_frame()
+            # Drain deferred UI updates — all DPG writes from background threads land here
+            while True:
+                try:
+                    msg = UI_UPDATE_QUEUE.get_nowait()
+                    if msg[0] == "set_value":
+                        dpg.set_value(msg[1], msg[2])
+                    elif msg[0] == "status":
+                        ok = msg[1]
+                        dpg.set_value("ui_status_text", "ONLINE" if ok else "PAUSED")
+                        dpg.configure_item("ui_status_text", color=(0, 255, 120) if ok else (239, 68, 68))
+                except queue.Empty:
+                    break
+    finally:
+        shutdown_runtime(stop_event, workers)
+        dpg.destroy_context()
 
 
 if __name__ == "__main__":
