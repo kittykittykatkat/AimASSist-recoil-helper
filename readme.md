@@ -23,15 +23,23 @@ Originally configured for the specific frame pacing and recoil mechanics of *The
 
 ## Prerequisites & Initial Provisioning
 
-- A Kmbox B/Net | Makcu/arduino
+- A KMBox B/Net for hardware output, or Simulation mode for testing
 - A laptop or miniPC
 
 ### Host Environment Requirements
 
-The host environment requires a standard **Python 3.10+** execution shell. Provision the baseline graphic framework and low-level system listener modules before runtime initialization:
+The bundled `kmNet.cp311-win_amd64.pyd` requires **64-bit Python 3.11 on Windows**. Install the application dependencies, then start the GUI from the repository root:
 
 ```bash
-pip install dearpygui keyboard
+python -m pip install -r requirements.txt
+python master_control.py
+```
+
+The standalone recoil profile tool additionally uses OpenCV and NumPy:
+
+```bash
+python -m pip install -r requirements-tools.txt
+python recoil_processor/profile_architect.py --weapon AKM --sens 22 --fov 100
 ```
 
 ### Module File Layout
@@ -39,14 +47,16 @@ pip install dearpygui keyboard
 To ensure proper workspace linkage, the native target link-layer module corresponding to your network hardware (`kmNet`) must reside directly within the immediate directory structure:
 
 ```
-|Recoil_processor| 
-├── run_extractor.py # AiO tool for generating recoil patterns
+|recoil_processor|
+├── profile_architect.py # Manual image-to-pattern tool
 ├── inputs/image.png
 ├── outputs/weaponname_profile.txt
 
 |AimASSist|
 ├── configs/           # Serialized JSON configuration profiles
-├── kmNet.pyd          # Native hardware interface abstraction binary
+├── overlay.json       # Fullscreen overlay appearance and placement
+├── overlay_renderer.py# Isolated fullscreen renderer
+├── kmNet.cp311-win_amd64.pyd # Native KMBox module for Python 3.11
 └── master_control.py  # Primary runtime interface and worker engine
 ```
 
@@ -72,6 +82,16 @@ To ensure proper workspace linkage, the native target link-layer module correspo
 3.  **Field of View (FOV)** - Match your in-game FOV to ensure the translation math remains perfectly accurate.
 4.  **Hardware Killswitch** - Map a mouse button (e.g., `Mouse 5`) to instantly kill or wake the device's hardware inputs.
 5.  **Panic Key** - Map a local keyboard hotkey (e.g., `/`, foot pedals, a controller paddle etc) as a background safety override to instantly pause the entire framework across the dual-PC setup.
+
+### Distance Scale
+
+The Recoil tab can switch the active profile between its baseline **25 m / 1x** output and **50 m / 2x** output without changing the profile's saved recoil nodes. Enable the toggle input and select either KMBox Mouse 4/5 or a key reported by the control PC, such as `num 1` or a keyboard-emulating foot pedal. Do not assign the same input to firing, a module killswitch, and distance scaling.
+
+KMBox connection, movement, and monitored-button failures are shown as **OFFLINE** in the sidebar. The detailed failure is displayed in the Settings panel.
+
+### Fullscreen Overlay
+
+The Overlay tab starts an isolated, borderless fullscreen renderer for single-display fuser setups. Display Fuser mode defaults to a black background; Transparent mode uses a click-through color-keyed background. Recoil, Burst, and Distance badges can each be enabled, colored, resized, positioned, and previewed in the GUI. Right-drag a badge directly on the fullscreen overlay to move it; its position is synchronized and saved automatically. A custom `.ttf` or `.otf` font is optional. The saved hide/show input defaults to local `F8`, but KMBox Mouse 4/5 can also be selected. Save writes these settings to `overlay.json` without changing weapon profiles.
 
 ## Notes
 > [!IMPORTANT]

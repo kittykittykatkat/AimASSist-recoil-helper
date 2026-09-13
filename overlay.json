@@ -1,0 +1,77 @@
+{
+    "mode": "Display Fuser",
+    "background_color": [
+        0,
+        0,
+        0,
+        255
+    ],
+    "always_on_top": true,
+    "click_through": true,
+    "toggle_source": "Local keyboard / pedal",
+    "toggle_key": "f8",
+    "font_path": "",
+    "font_scale": 1.0,
+    "badges": {
+        "recoil": {
+            "enabled": true,
+            "label": "RECOIL",
+            "x": 44,
+            "y": 408,
+            "width": 150,
+            "height": 42,
+            "on_color": [
+                0,
+                210,
+                120,
+                230
+            ],
+            "off_color": [
+                55,
+                55,
+                65,
+                180
+            ]
+        },
+        "burst": {
+            "enabled": true,
+            "label": "BURST",
+            "x": 44,
+            "y": 457,
+            "width": 150,
+            "height": 42,
+            "on_color": [
+                0,
+                170,
+                235,
+                230
+            ],
+            "off_color": [
+                55,
+                55,
+                65,
+                180
+            ]
+        },
+        "distance": {
+            "enabled": true,
+            "label": "DISTANCE",
+            "x": 43,
+            "y": 508,
+            "width": 150,
+            "height": 42,
+            "on_color": [
+                255,
+                170,
+                40,
+                230
+            ],
+            "off_color": [
+                0,
+                160,
+                95,
+                210
+            ]
+        }
+    }
+}

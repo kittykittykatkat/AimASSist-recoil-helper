@@ -29,6 +29,14 @@ class RecordingDevice(master_control.HWDevice):
         return False
 
 
+def drain_ui_updates():
+    while True:
+        try:
+            master_control.UI_UPDATE_QUEUE.get_nowait()
+        except queue.Empty:
+            return
+
+
 def test_keyboard_listener_stops_when_requested(monkeypatch):
     stop_event = threading.Event()
     monkeypatch.setattr(master_control.keyboard, "is_pressed", lambda key: False)
@@ -106,3 +114,147 @@ def test_recoil_has_priority_when_both_modules_trigger():
     )
 
     assert (mode, is_firing) == ("Recoil", True)
+
+
+def test_distance_scale_multiplier_switches_between_1x_and_2x():
+    assert master_control.get_distance_scale_multiplier(False) == 1.0
+    assert master_control.get_distance_scale_multiplier(True) == 2.0
+
+
+def test_overlay_opacity_snaps_to_five_percent_steps():
+    assert master_control.snap_overlay_opacity(0.0) == 0.0
+    assert master_control.snap_overlay_opacity(0.63) == 0.65
+    assert master_control.snap_overlay_opacity(0.98) == 1.0
+    assert master_control.snap_overlay_opacity(-1) == 0.0
+
+
+def test_distance_scale_latch_toggles_once_per_press():
+    active, previous = master_control.update_distance_scale_latch(False, True, False)
+    assert (active, previous) == (True, True)
+
+    active, previous = master_control.update_distance_scale_latch(active, True, previous)
+    assert (active, previous) == (True, True)
+
+    active, previous = master_control.update_distance_scale_latch(active, False, previous)
+    active, previous = master_control.update_distance_scale_latch(active, True, previous)
+    assert (active, previous) == (False, True)
+
+
+def test_distance_scale_uses_kmbox_mouse_source(monkeypatch):
+    pressed_buttons = []
+
+    class InputDevice(RecordingDevice):
+        def is_down(self, button):
+            pressed_buttons.append(button)
+            return True
+
+    monkeypatch.setattr(master_control, "DEVICE", InputDevice())
+
+    assert master_control.is_distance_scale_pressed("KMBox Mouse 4", "unused")
+    assert pressed_buttons == ["Mouse 4"]
+
+
+def test_distance_scale_uses_local_keyboard_or_pedal(monkeypatch):
+    pressed_keys = []
+    monkeypatch.setattr(
+        master_control.keyboard,
+        "is_pressed",
+        lambda key: pressed_keys.append(key) or True,
+    )
+
+    assert master_control.is_distance_scale_pressed(
+        "Local keyboard / pedal", "num 1"
+    )
+    assert pressed_keys == ["num 1"]
+
+
+def test_overlay_toggle_supports_local_and_kmbox_sources(monkeypatch):
+    pressed = []
+    monkeypatch.setattr(
+        master_control.keyboard,
+        "is_pressed",
+        lambda key: pressed.append(("local", key)) or True,
+    )
+
+    class InputDevice(RecordingDevice):
+        def is_down(self, button):
+            pressed.append(("kmbox", button))
+            return True
+
+    monkeypatch.setattr(master_control, "DEVICE", InputDevice())
+
+    assert master_control.is_overlay_toggle_pressed("Local keyboard / pedal", "f8")
+    assert master_control.is_overlay_toggle_pressed("KMBox Mouse 5", "unused")
+    assert pressed == [("local", "f8"), ("kmbox", "Mouse 5")]
+
+
+def test_overlay_enabled_checkbox_controls_renderer(monkeypatch):
+    calls = []
+    monkeypatch.setattr(master_control, "start_overlay", lambda: calls.append("start"))
+    monkeypatch.setattr(master_control, "stop_overlay", lambda: calls.append("stop"))
+
+    master_control.callback_overlay_enabled(None, True)
+    master_control.callback_overlay_enabled(None, False)
+
+    assert calls == ["start", "stop"]
+
+
+def test_reconnect_disconnects_previous_device(monkeypatch):
+    previous = RecordingDevice()
+    replacement = RecordingDevice()
+    replacement.connect = lambda **kwargs: True
+    monkeypatch.setattr(master_control, "DEVICE", previous)
+    monkeypatch.setattr(master_control, "KMBoxDevice", lambda: replacement)
+
+    connected = master_control.connect_device_from_config({
+        "device_type": "KMBox",
+        "kmbox_ip": "127.0.0.1",
+        "kmbox_port": "8808",
+        "kmbox_id": "test",
+        "kmbox_monitor": 8888,
+    })
+
+    assert connected
+    assert previous.disconnected
+    assert master_control.DEVICE is replacement
+
+
+def test_kmbox_move_failure_posts_offline_status(monkeypatch):
+    class FailingKMNet:
+        @staticmethod
+        def move(x, y):
+            raise OSError("connection lost")
+
+    drain_ui_updates()
+    monkeypatch.setattr(master_control, "km", FailingKMNet())
+    device = master_control.KMBoxDevice()
+    device._ok = True
+
+    device.move(1, 2)
+
+    assert not device.is_connected()
+    assert master_control.UI_UPDATE_QUEUE.get_nowait() == (
+        "device_status",
+        False,
+        "KMBox move failed: connection lost",
+    )
+
+
+def test_kmbox_input_failure_posts_offline_status(monkeypatch):
+    class FailingKMNet:
+        @staticmethod
+        def isdown_side2():
+            raise OSError("monitor stopped")
+
+    drain_ui_updates()
+    monkeypatch.setattr(master_control, "km", FailingKMNet())
+    device = master_control.KMBoxDevice()
+    device._ok = True
+
+    assert not device.is_down("Mouse 5")
+    assert not device.is_connected()
+    assert master_control.UI_UPDATE_QUEUE.get_nowait() == (
+        "device_status",
+        False,
+        "KMBox input read failed: monitor stopped",
+    )

@@ -1,6 +1,8 @@
-import os, sys, time, json, glob, random, queue, threading, logging, ctypes
+import os, sys, time, json, glob, random, queue, threading, logging, ctypes, multiprocessing
 import keyboard
 import dearpygui.dearpygui as dpg
+from overlay_config import load_overlay_config, save_overlay_config, validate_overlay_config
+from overlay_renderer import run_overlay
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] %(message)s', datefmt='%H:%M:%S')
 os.environ["PYTHONTIMERRESOLUTION"] = "1"
@@ -52,7 +54,9 @@ class KMBoxDevice(HWDevice):
         self._ok = False
     def connect(self, ip="192.168.2.188", port="8808", device_id="00000000", monitor_port=8888, **kw):
         if not KM_AVAILABLE:
-            logging.error("kmNet not installed. Run: pip install kmNet")
+            message = "kmNet not installed; the bundled module requires 64-bit Python 3.11."
+            logging.error(message)
+            post_device_status(False, message)
             return False
         try:
             km.init(ip, port, device_id)
@@ -62,13 +66,24 @@ class KMBoxDevice(HWDevice):
             return True
         except Exception as e:
             self._ok = False
-            logging.error(f"KMBox connect failed: {e}")
+            message = f"KMBox connect failed: {e}"
+            logging.error(message)
+            post_device_status(False, message)
             return False
     def disconnect(self): self._ok = False
+    def _fail(self, operation, exc):
+        if not self._ok:
+            return
+        self._ok = False
+        message = f"KMBox {operation} failed: {exc}"
+        logging.error(message)
+        post_device_status(False, message)
     def move(self, x, y):
         if self._ok:
-            try: km.move(x, y)
-            except: self._ok = False
+            try:
+                km.move(x, y)
+            except Exception as exc:
+                self._fail("move", exc)
     def is_down(self, button):
         if not self._ok: return False
         b = button.lower()
@@ -77,7 +92,8 @@ class KMBoxDevice(HWDevice):
             if b in ("mouse 4", "m4"):      return km.isdown_side1() == 1
             if b in ("left click", "left"): return km.isdown_left()  == 1
             if b in ("right click","right"):return km.isdown_right() == 1
-        except: self._ok = False
+        except Exception as exc:
+            self._fail("input read", exc)
         return False
     def is_connected(self): return self._ok
     def name(self): return "KMBox"
@@ -186,20 +202,28 @@ def save_device_config(cfg: dict):
 
 def connect_device_from_config(cfg: dict) -> bool:
     global DEVICE
+    previous_device = DEVICE
     dtype = cfg.get("device_type", "KMBox")
     if dtype == "KMBox":
-        DEVICE = KMBoxDevice()
-        return DEVICE.connect(
+        new_device = KMBoxDevice()
+        connected = new_device.connect(
             ip=cfg["kmbox_ip"], port=cfg["kmbox_port"],
             device_id=cfg["kmbox_id"], monitor_port=cfg["kmbox_monitor"]
         )
     elif dtype == "Makcu":
-        DEVICE = MakcuDevice()
-        return DEVICE.connect(com_port=cfg["makcu_com"], baud_rate=cfg["makcu_baud"])
+        new_device = MakcuDevice()
+        connected = new_device.connect(
+            com_port=cfg["makcu_com"], baud_rate=cfg["makcu_baud"]
+        )
     else:
-        DEVICE = SimDevice()
-        DEVICE.connect()
-        return True
+        new_device = SimDevice()
+        connected = new_device.connect()
+    try:
+        previous_device.disconnect()
+    except Exception as exc:
+        logging.warning(f"Previous device disconnect failed: {exc}")
+    DEVICE = new_device
+    return connected
 
 def get_available_com_ports() -> list:
     try:
@@ -218,6 +242,28 @@ STATE_LOCK      = threading.Lock()
 UI_UPDATE_QUEUE = queue.Queue(maxsize=32)
 
 KS_KEY_OPTIONS = ["None", "Mouse 5", "Mouse 4", "Left Click", "Right Click"]
+DISTANCE_SCALE_SOURCES = ["KMBox Mouse 5", "KMBox Mouse 4", "Local keyboard / pedal"]
+
+def post_device_status(connected, message):
+    """Queue a device state change for DearPyGui's main thread."""
+    try:
+        UI_UPDATE_QUEUE.put_nowait(("device_status", connected, message))
+    except queue.Full:
+        logging.error(f"Device status update dropped: {message}")
+
+def is_distance_scale_pressed(source, local_key):
+    """Read the configured 2x toggle from KMBox or a local keyboard HID."""
+    if source == "KMBox Mouse 5":
+        return DEVICE.is_down("Mouse 5")
+    if source == "KMBox Mouse 4":
+        return DEVICE.is_down("Mouse 4")
+    return keyboard.is_pressed(local_key) if local_key else False
+
+def is_overlay_toggle_pressed(source, local_key):
+    """Read the overlay toggle from a local HID or KMBox mouse button."""
+    if source == "Local keyboard / pedal":
+        return keyboard.is_pressed(local_key) if local_key else False
+    return is_distance_scale_pressed(source, "")
 
 # ---------------------------------------------------------------------------
 # RUNTIME STATE
@@ -248,6 +294,10 @@ DEFAULT_STATE = {
     "recoil_jitter":      0.05,
     "time_step_interval": 0.15,
     "overlay_mode":       "None",
+    "distance_scale_enabled":   False,
+    "distance_scale_source":    "Local keyboard / pedal",
+    "distance_scale_local_key": "num 1",
+    "distance_scale_2x_active": False,
 
     "burst_count":           3,
     "burst_y_pull":          14.0,
@@ -258,6 +308,25 @@ DEFAULT_STATE = {
     "hw_killswitch_enabled": False,
     "hw_killswitch_key":     "Mouse 5",
 }
+
+OVERLAY_CONFIG = load_overlay_config()
+OVERLAY_PROCESS = None
+OVERLAY_COMMAND_QUEUE = None
+OVERLAY_STATUS_QUEUE = None
+
+OVERLAY_COLOR_PALETTE = {
+    "Green":  [0, 210, 120],
+    "Cyan":   [0, 190, 255],
+    "Blue":   [55, 110, 255],
+    "Purple": [155, 70, 240],
+    "Orange": [255, 170, 40],
+    "Red":    [239, 68, 68],
+    "White":  [235, 235, 240],
+    "Gray":   [70, 70, 82],
+}
+OVERLAY_TOGGLE_SOURCES = ["Local keyboard / pedal", "KMBox Mouse 4", "KMBox Mouse 5"]
+OVERLAY_LAYOUT_W, OVERLAY_LAYOUT_H = 560, 260
+_overlay_drag = {"name": None, "last": None}
 
 # ---------------------------------------------------------------------------
 # DARK TITLEBAR
@@ -290,6 +359,7 @@ def _apply_dark_titlebar_worker(stop_event=None):
 # ---------------------------------------------------------------------------
 def main_pc_keyboard_listener_worker(stop_event=None):
     latch = False
+    overlay_latch = False
     while not stop_event or not stop_event.is_set():
         try:
             with STATE_LOCK:
@@ -305,6 +375,17 @@ def main_pc_keyboard_listener_worker(stop_event=None):
                     logging.info(f"PC panic: {'ONLINE' if active else 'PAUSED'}")
             else:
                 latch = False
+            overlay_source = OVERLAY_CONFIG.get("toggle_source", "Local keyboard / pedal")
+            overlay_pressed = overlay_source == "Local keyboard / pedal" and is_overlay_toggle_pressed(
+                overlay_source, OVERLAY_CONFIG.get("toggle_key", "f8")
+            )
+            if overlay_pressed:
+                if not overlay_latch:
+                    overlay_latch = True
+                    try: UI_UPDATE_QUEUE.put_nowait(("overlay_toggle",))
+                    except queue.Full: pass
+            else:
+                overlay_latch = False
         except Exception: pass
         if stop_event:
             stop_event.wait(0.01)
@@ -350,6 +431,16 @@ def select_runtime_mode(state, recoil_triggered, burst_triggered, ads, burst_in_
         return "Burst", burst_ready
     return "None", False
 
+def get_distance_scale_multiplier(scale_2x_active):
+    """Return the runtime recoil multiplier for the selected distance mode."""
+    return 2.0 if scale_2x_active else 1.0
+
+def update_distance_scale_latch(scale_2x_active, pressed, previously_pressed):
+    """Toggle distance scale once on each input press edge."""
+    if pressed and not previously_pressed:
+        scale_2x_active = not scale_2x_active
+    return scale_2x_active, pressed
+
 # ---------------------------------------------------------------------------
 # CONFIG I/O
 # ---------------------------------------------------------------------------
@@ -381,6 +472,9 @@ def callback_save_config(sender, app_data):
         "recoil_jitter":          dpg.get_value("ui_recoil_jitter"),
         "time_step_interval":     dpg.get_value("ui_time_interval"),
         "overlay_mode":           dpg.get_value("ui_overlay_combo"),
+        "distance_scale_enabled": dpg.get_value("ui_distance_scale_enabled"),
+        "distance_scale_source":  dpg.get_value("ui_distance_scale_source"),
+        "distance_scale_local_key": dpg.get_value("ui_distance_scale_local_key"),
         "recoil_nodes":           DEFAULT_STATE["recoil_nodes"],
         "burst_count":            dpg.get_value("ui_burst_count"),
         "burst_y_pull":           dpg.get_value("ui_burst_pull"),
@@ -420,6 +514,10 @@ def callback_load_config(sender, app_data):
         dpg.set_value("ui_recoil_jitter",        data.get("recoil_jitter",      0.05))
         dpg.set_value("ui_time_interval",        data.get("time_step_interval", 0.15))
         dpg.set_value("ui_overlay_combo",        data.get("overlay_mode",       "None"))
+        dpg.set_value("ui_distance_scale_enabled", data.get("distance_scale_enabled", False))
+        dpg.set_value("ui_distance_scale_source", data.get("distance_scale_source", "Local keyboard / pedal"))
+        dpg.set_value("ui_distance_scale_local_key", data.get("distance_scale_local_key", "num 1"))
+        callback_distance_scale_source(None, data.get("distance_scale_source", "Local keyboard / pedal"))
         dpg.set_value("ui_burst_count",          data.get("burst_count",        3))
         dpg.set_value("ui_burst_pull",           data.get("burst_y_pull",       14.0))
         dpg.set_value("ui_burst_x",              data.get("burst_x_pull",       0.0))
@@ -428,13 +526,19 @@ def callback_load_config(sender, app_data):
         dpg.set_value("ui_hw_ks_enabled",        data.get("hw_killswitch_enabled", False))
         dpg.set_value("ui_hw_ks_key_combo",      data.get("hw_killswitch_key",  "Mouse 5"))
         DEFAULT_STATE["recoil_nodes"] = data.get("recoil_nodes", [[0.0, 0.0, 0.0]])
+        data["distance_scale_2x_active"] = False
         # Push full blob — maxsize=16 means this won't stomp a simultaneous change
         try: DATA_QUEUE.put_nowait(data)
         except queue.Full: pass
         with STATE_LOCK:
+            DEFAULT_STATE["recoil_module_enabled"] = data.get("recoil_module_enabled", True)
+            DEFAULT_STATE["burst_module_enabled"]  = data.get("burst_module_enabled", True)
             DEFAULT_STATE["toggle_key"]            = data.get("toggle_key", "/")
             DEFAULT_STATE["hw_killswitch_enabled"] = data.get("hw_killswitch_enabled", False)
             DEFAULT_STATE["hw_killswitch_key"]     = data.get("hw_killswitch_key", "Mouse 5")
+            DEFAULT_STATE["distance_scale_2x_active"] = False
+        _update_distance_scale_ui(False)
+        send_overlay_state()
         redraw_recoil_canvas()
         redraw_burst_canvas()
         logging.info(f"Loaded: {filename}")
@@ -473,6 +577,8 @@ def hardware_consumer_engine(data_mailbox, stop_event=None):
     r_ks_prev            = False
     b_ks_prev            = False
     hw_ks_prev           = False
+    distance_scale_prev  = False
+    overlay_toggle_prev  = False
 
     # Pre-sorted nodes cache — only re-sorts when the list object changes
     _nodes_sorted   = []
@@ -485,6 +591,9 @@ def hardware_consumer_engine(data_mailbox, stop_event=None):
     def ui_post(tag, value):
         try: UI_UPDATE_QUEUE.put_nowait(("set_value", tag, value))
         except queue.Full: pass
+        if tag in ("ui_toggle_recoil_mod", "ui_toggle_burst_mod"):
+            try: UI_UPDATE_QUEUE.put_nowait(("runtime_state",))
+            except queue.Full: pass
 
     while not stop_event or not stop_event.is_set():
         try:
@@ -551,6 +660,16 @@ def hardware_consumer_engine(data_mailbox, stop_event=None):
             else:
                 hw_ks_prev = False
 
+            overlay_source = OVERLAY_CONFIG.get("toggle_source", "Local keyboard / pedal")
+            if overlay_source != "Local keyboard / pedal":
+                overlay_pressed = is_overlay_toggle_pressed(overlay_source, "")
+                if overlay_pressed and not overlay_toggle_prev:
+                    try: UI_UPDATE_QUEUE.put_nowait(("overlay_toggle",))
+                    except queue.Full: pass
+                overlay_toggle_prev = overlay_pressed
+            else:
+                overlay_toggle_prev = False
+
             if not is_active:
                 in_burst_sequence    = False
                 recoil_trigger_latch = False
@@ -558,6 +677,26 @@ def hardware_consumer_engine(data_mailbox, stop_event=None):
                 burst_toggled_on     = False
                 time.sleep(0.01)
                 continue
+
+            if rs["distance_scale_enabled"]:
+                scale_pressed = is_distance_scale_pressed(
+                    rs["distance_scale_source"], rs["distance_scale_local_key"]
+                )
+                scale_2x, next_scale_prev = update_distance_scale_latch(
+                    rs["distance_scale_2x_active"], scale_pressed, distance_scale_prev
+                )
+                if scale_2x != rs["distance_scale_2x_active"]:
+                    rs["distance_scale_2x_active"] = scale_2x
+                    with STATE_LOCK:
+                        DEFAULT_STATE["distance_scale_2x_active"] = scale_2x
+                    try:
+                        UI_UPDATE_QUEUE.put_nowait(("distance_scale", scale_2x))
+                    except queue.Full:
+                        logging.warning("Distance scale UI update dropped")
+                    logging.info(f"Distance scale: {'50 m / 2x' if scale_2x else '25 m / 1x'}")
+                distance_scale_prev = next_scale_prev
+            else:
+                distance_scale_prev = False
 
             # -- HOT PATH --
             now     = time.perf_counter()
@@ -598,8 +737,9 @@ def hardware_consumer_engine(data_mailbox, stop_event=None):
                         recoil_trigger_latch = True
                         start_burst_time     = now
                     vx, vy = get_interpolated_velocity(now - start_burst_time, _nodes_sorted)
-                    fx = vx * rs["recoil_scale_x"] * fov_mod * sens_mod
-                    fy = vy * rs["recoil_scale_y"] * fov_mod * sens_mod
+                    distance_mod = get_distance_scale_multiplier(rs["distance_scale_2x_active"])
+                    fx = vx * rs["recoil_scale_x"] * distance_mod * fov_mod * sens_mod
+                    fy = vy * rs["recoil_scale_y"] * distance_mod * fov_mod * sens_mod
                     if rs["recoil_jitter"] > 0:
                         fx += random.uniform(-rs["recoil_jitter"], rs["recoil_jitter"]) * 5
                     accum_x += fx; accum_y += fy
@@ -842,6 +982,10 @@ def callback_canvas_right_click(sender, app_data):
 
 
 def callback_global_mouse_move(sender, app_data):
+    if (not _overlay_drag["name"] and dpg.does_item_exist("ui_overlay_layout")
+            and dpg.is_mouse_button_down(1) and dpg.is_item_hovered("ui_overlay_layout")):
+        callback_overlay_layout_press(sender, app_data)
+    callback_overlay_layout_drag(sender, app_data)
     if not _drag["active"]:
         return
     if not dpg.is_mouse_button_down(0):
@@ -1020,10 +1164,351 @@ def redraw_burst_canvas():
 def ui_thread_push_sync(sender, app_data, user_data):
     try: DATA_QUEUE.put_nowait({user_data: app_data})
     except queue.Full: pass
+    if user_data in ["recoil_module_enabled", "burst_module_enabled"]:
+        with STATE_LOCK:
+            DEFAULT_STATE[user_data] = app_data
+        send_overlay_state()
     if user_data in ["burst_count", "burst_y_pull", "burst_x_pull"]:
         redraw_burst_canvas()
     if user_data == "time_step_interval":
         _recalc_node_times()
+
+# ---------------------------------------------------------------------------
+# FULLSCREEN OVERLAY
+# ---------------------------------------------------------------------------
+def current_overlay_state():
+    """Return the small runtime-state subset consumed by the renderer."""
+    with STATE_LOCK:
+        return {
+            "recoil_enabled": bool(DEFAULT_STATE["recoil_module_enabled"]),
+            "burst_enabled": bool(DEFAULT_STATE["burst_module_enabled"]),
+            "distance_2x": bool(DEFAULT_STATE["distance_scale_2x_active"]),
+        }
+
+def send_overlay_state():
+    if OVERLAY_PROCESS and OVERLAY_PROCESS.is_alive() and OVERLAY_COMMAND_QUEUE:
+        try:
+            OVERLAY_COMMAND_QUEUE.put_nowait(("state", current_overlay_state()))
+        except queue.Full:
+            logging.warning("Overlay state update dropped")
+
+def start_overlay():
+    """Start the isolated renderer using current validated settings."""
+    global OVERLAY_PROCESS, OVERLAY_COMMAND_QUEUE, OVERLAY_STATUS_QUEUE
+    if OVERLAY_PROCESS and OVERLAY_PROCESS.is_alive():
+        send_overlay_state()
+        return
+    context = multiprocessing.get_context("spawn")
+    OVERLAY_COMMAND_QUEUE = context.Queue(maxsize=16)
+    OVERLAY_STATUS_QUEUE = context.Queue(maxsize=16)
+    OVERLAY_PROCESS = context.Process(
+        target=run_overlay,
+        args=(OVERLAY_COMMAND_QUEUE, OVERLAY_STATUS_QUEUE, OVERLAY_CONFIG, current_overlay_state()),
+        name="overlay-renderer",
+        daemon=True,
+    )
+    OVERLAY_PROCESS.start()
+    _set_overlay_enabled_ui(True)
+    _update_overlay_process_ui("STARTING", (255, 190, 60))
+
+def stop_overlay():
+    """Request renderer shutdown and terminate only if it cannot exit promptly."""
+    global OVERLAY_PROCESS, OVERLAY_COMMAND_QUEUE, OVERLAY_STATUS_QUEUE
+    process = OVERLAY_PROCESS
+    if not process:
+        _set_overlay_enabled_ui(False)
+        return
+    if process.is_alive() and OVERLAY_COMMAND_QUEUE:
+        try:
+            OVERLAY_COMMAND_QUEUE.put_nowait(("stop",))
+        except queue.Full:
+            pass
+        process.join(timeout=1.5)
+    if process.is_alive():
+        logging.warning("Overlay renderer did not stop cleanly; terminating it")
+        process.terminate()
+        process.join(timeout=1.0)
+    OVERLAY_PROCESS = None
+    OVERLAY_COMMAND_QUEUE = None
+    OVERLAY_STATUS_QUEUE = None
+    _set_overlay_enabled_ui(False)
+    _update_overlay_process_ui("STOPPED", (140, 140, 150))
+
+def restart_overlay():
+    stop_overlay()
+    start_overlay()
+
+def callback_overlay_start(sender, app_data):
+    start_overlay()
+
+def callback_overlay_stop(sender, app_data):
+    stop_overlay()
+
+def callback_overlay_restart(sender, app_data):
+    restart_overlay()
+
+def callback_overlay_enabled(sender, app_data):
+    """Start or stop the overlay from the GUI's primary toggle."""
+    if app_data:
+        start_overlay()
+    else:
+        stop_overlay()
+
+def _set_overlay_enabled_ui(enabled):
+    does_item_exist = getattr(dpg, "does_item_exist", None)
+    if does_item_exist and does_item_exist("ui_overlay_enabled"):
+        dpg.set_value("ui_overlay_enabled", bool(enabled))
+
+def _update_overlay_process_ui(text, color):
+    if dpg.does_item_exist("ui_overlay_status"):
+        dpg.set_value("ui_overlay_status", text)
+        dpg.configure_item("ui_overlay_status", color=color)
+
+def poll_overlay_status():
+    """Drain renderer lifecycle messages on DearPyGui's main thread."""
+    if not OVERLAY_STATUS_QUEUE:
+        return
+    while True:
+        try:
+            message = OVERLAY_STATUS_QUEUE.get_nowait()
+        except queue.Empty:
+            break
+        status = message[0]
+        if status in ("badge_moved", "badge_move_finished"):
+            _, name, x, y = message
+            badge = OVERLAY_CONFIG["badges"][name]
+            badge["x"], badge["y"] = x, y
+            dpg.set_value(f"ui_overlay_{name}_x", x)
+            dpg.set_value(f"ui_overlay_{name}_y", y)
+            redraw_overlay_previews()
+            if status == "badge_move_finished":
+                save_overlay_config(OVERLAY_CONFIG)
+                _update_overlay_process_ui("SAVED POSITION", (0, 200, 120))
+            continue
+        detail = message[1]
+        if status == "running":
+            _set_overlay_enabled_ui(True)
+            _update_overlay_process_ui("RUNNING", (0, 200, 120))
+        elif status == "error":
+            _set_overlay_enabled_ui(False)
+            _update_overlay_process_ui(f"ERROR: {detail}", (239, 68, 68))
+        else:
+            _set_overlay_enabled_ui(False)
+            _update_overlay_process_ui("STOPPED", (140, 140, 150))
+
+def _overlay_config_from_ui():
+    background_color = list(dpg.get_value("ui_overlay_background_color"))
+    background_color[3] = round(dpg.get_value("ui_overlay_background_opacity") * 255)
+    config = {
+        "mode": dpg.get_value("ui_fullscreen_overlay_mode"),
+        "background_color": background_color,
+        "always_on_top": dpg.get_value("ui_overlay_topmost"),
+        "click_through": dpg.get_value("ui_overlay_click_through"),
+        "toggle_source": dpg.get_value("ui_overlay_toggle_source"),
+        "toggle_key": dpg.get_value("ui_overlay_toggle_key"),
+        "font_path": dpg.get_value("ui_overlay_font_path"),
+        "font_scale": dpg.get_value("ui_overlay_font_scale"),
+        "badges": {},
+    }
+    for name in ("recoil", "burst", "distance"):
+        prefix = f"ui_overlay_{name}"
+        on_color = list(dpg.get_value(f"{prefix}_on_color"))
+        off_color = list(dpg.get_value(f"{prefix}_off_color"))
+        alpha = round(dpg.get_value(f"{prefix}_opacity") * 255)
+        on_color[3] = alpha
+        off_color[3] = alpha
+        config["badges"][name] = {
+            "enabled": dpg.get_value(f"{prefix}_enabled"),
+            "label": dpg.get_value(f"{prefix}_label"),
+            "x": dpg.get_value(f"{prefix}_x"),
+            "y": dpg.get_value(f"{prefix}_y"),
+            "width": dpg.get_value(f"{prefix}_width"),
+            "height": dpg.get_value(f"{prefix}_height"),
+            "on_color": on_color,
+            "off_color": off_color,
+        }
+    return validate_overlay_config(config)
+
+def callback_overlay_setting_changed(sender, app_data):
+    global OVERLAY_CONFIG
+    OVERLAY_CONFIG = _overlay_config_from_ui()
+    redraw_overlay_previews()
+    if OVERLAY_PROCESS and OVERLAY_PROCESS.is_alive() and OVERLAY_COMMAND_QUEUE:
+        try:
+            OVERLAY_COMMAND_QUEUE.put_nowait(("config", OVERLAY_CONFIG))
+        except queue.Full:
+            logging.warning("Overlay config update dropped")
+
+def callback_overlay_save(sender, app_data):
+    global OVERLAY_CONFIG
+    OVERLAY_CONFIG = save_overlay_config(_overlay_config_from_ui())
+    _update_overlay_process_ui("SAVED", (0, 200, 120))
+
+def callback_overlay_reset(sender, app_data):
+    global OVERLAY_CONFIG
+    OVERLAY_CONFIG = validate_overlay_config({})
+    apply_overlay_config_to_ui(OVERLAY_CONFIG)
+    callback_overlay_setting_changed(None, None)
+    if OVERLAY_PROCESS and OVERLAY_PROCESS.is_alive():
+        restart_overlay()
+
+def apply_overlay_config_to_ui(config):
+    dpg.set_value("ui_fullscreen_overlay_mode", config["mode"])
+    dpg.set_value("ui_overlay_background_color", config["background_color"])
+    dpg.set_value("ui_overlay_background_opacity", _alpha_to_opacity(config["background_color"][3]))
+    dpg.set_value("ui_overlay_topmost", config["always_on_top"])
+    dpg.set_value("ui_overlay_click_through", config["click_through"])
+    dpg.set_value("ui_overlay_toggle_source", config["toggle_source"])
+    dpg.set_value("ui_overlay_toggle_key", config["toggle_key"])
+    dpg.set_value("ui_overlay_font_path", config["font_path"])
+    dpg.set_value("ui_overlay_font_scale", config["font_scale"])
+    for name, badge in config["badges"].items():
+        prefix = f"ui_overlay_{name}"
+        for field in ("enabled", "label", "x", "y", "width", "height", "on_color", "off_color"):
+            dpg.set_value(f"{prefix}_{field}", badge[field])
+        dpg.set_value(f"{prefix}_opacity", _alpha_to_opacity(badge["on_color"][3]))
+    redraw_overlay_previews()
+
+def _alpha_to_opacity(alpha):
+    return round((alpha / 255.0) / 0.05) * 0.05
+
+def snap_overlay_opacity(value):
+    """Clamp opacity to the 0.05 increments exposed by the GUI."""
+    return max(0.0, min(1.0, round(float(value) / 0.05) * 0.05))
+
+def callback_overlay_opacity(sender, app_data, user_data):
+    """Snap badge opacity sliders to explicit 0.05 increments."""
+    snapped = snap_overlay_opacity(app_data)
+    dpg.set_value(sender, snapped)
+    callback_overlay_setting_changed(sender, snapped)
+
+def callback_overlay_palette(sender, app_data, user_data):
+    """Apply a named RGB swatch while preserving the current opacity."""
+    name, state_name, rgb = user_data
+    prefix = f"ui_overlay_{name}_{state_name}"
+    opacity = dpg.get_value(f"ui_overlay_{name}_opacity")
+    dpg.set_value(f"{prefix}_color", [*rgb, round(opacity * 255)])
+    callback_overlay_setting_changed(sender, app_data)
+
+def callback_overlay_background_palette(sender, app_data, user_data):
+    color = list(dpg.get_value("ui_overlay_background_color"))
+    dpg.set_value("ui_overlay_background_color", [*user_data, color[3]])
+    callback_overlay_setting_changed(sender, app_data)
+
+def callback_overlay_background_opacity(sender, app_data):
+    snapped = snap_overlay_opacity(app_data)
+    dpg.set_value(sender, snapped)
+    color = list(dpg.get_value("ui_overlay_background_color"))
+    color[3] = round(snapped * 255)
+    dpg.set_value("ui_overlay_background_color", color)
+    callback_overlay_setting_changed(sender, snapped)
+
+def callback_overlay_toggle_source(sender, app_data):
+    dpg.set_value("ui_overlay_toggle_source", app_data)
+    if app_data == "Local keyboard / pedal":
+        dpg.show_item("ui_overlay_toggle_key")
+    else:
+        dpg.hide_item("ui_overlay_toggle_key")
+    callback_overlay_setting_changed(sender, app_data)
+
+def callback_overlay_font_selected(sender, app_data):
+    selections = app_data.get("selections", {})
+    if selections:
+        dpg.set_value("ui_overlay_font_path", list(selections.values())[0])
+        callback_overlay_setting_changed(sender, app_data)
+        if OVERLAY_PROCESS and OVERLAY_PROCESS.is_alive():
+            restart_overlay()
+
+def callback_overlay_font_browse(sender, app_data):
+    dpg.show_item("overlay_font_dialog")
+
+def redraw_overlay_layout():
+    """Draw a scaled primary-screen layout for direct badge placement."""
+    if not dpg.does_item_exist("ui_overlay_layout"):
+        return
+    dpg.delete_item("ui_overlay_layout", children_only=True)
+    config = _overlay_config_from_ui()
+    screen_w = max(1, ctypes.windll.user32.GetSystemMetrics(0))
+    screen_h = max(1, ctypes.windll.user32.GetSystemMetrics(1))
+    sx, sy = OVERLAY_LAYOUT_W / screen_w, OVERLAY_LAYOUT_H / screen_h
+    dpg.draw_rectangle((0, 0), (OVERLAY_LAYOUT_W, OVERLAY_LAYOUT_H),
+                       color=(65, 65, 80, 255), fill=(6, 6, 9, 255),
+                       parent="ui_overlay_layout")
+    for name, badge in config["badges"].items():
+        if not badge["enabled"]:
+            continue
+        x, y = badge["x"] * sx, badge["y"] * sy
+        w, h = max(12, badge["width"] * sx), max(8, badge["height"] * sy)
+        color = badge["on_color"]
+        dpg.draw_rectangle((x, y), (x + w, y + h), color=color, fill=color,
+                           rounding=2, parent="ui_overlay_layout")
+        dpg.draw_text((x + 3, y + 2), name.upper(), size=9,
+                      color=(255, 255, 255, 255), parent="ui_overlay_layout")
+
+def callback_overlay_layout_press(sender, app_data):
+    _overlay_drag.update(name=None, last=dpg.get_mouse_pos(local=False))
+    mouse_x, mouse_y = dpg.get_mouse_pos(local=False)
+    item_x, item_y = dpg.get_item_rect_min("ui_overlay_layout")
+    mx, my = mouse_x - item_x, mouse_y - item_y
+    config = _overlay_config_from_ui()
+    screen_w = max(1, ctypes.windll.user32.GetSystemMetrics(0))
+    screen_h = max(1, ctypes.windll.user32.GetSystemMetrics(1))
+    sx, sy = OVERLAY_LAYOUT_W / screen_w, OVERLAY_LAYOUT_H / screen_h
+    for name in reversed(("recoil", "burst", "distance")):
+        badge = config["badges"][name]
+        x, y = badge["x"] * sx, badge["y"] * sy
+        w, h = max(12, badge["width"] * sx), max(8, badge["height"] * sy)
+        if badge["enabled"] and x <= mx <= x + w and y <= my <= y + h:
+            _overlay_drag["name"] = name
+            break
+
+def callback_overlay_layout_drag(sender, app_data):
+    name = _overlay_drag["name"]
+    if not name or not dpg.is_mouse_button_down(1):
+        return
+    current = dpg.get_mouse_pos(local=False)
+    last = _overlay_drag["last"]
+    screen_w = max(1, ctypes.windll.user32.GetSystemMetrics(0))
+    screen_h = max(1, ctypes.windll.user32.GetSystemMetrics(1))
+    dx = round((current[0] - last[0]) * screen_w / OVERLAY_LAYOUT_W)
+    dy = round((current[1] - last[1]) * screen_h / OVERLAY_LAYOUT_H)
+    prefix = f"ui_overlay_{name}"
+    dpg.set_value(f"{prefix}_x", max(0, dpg.get_value(f"{prefix}_x") + dx))
+    dpg.set_value(f"{prefix}_y", max(0, dpg.get_value(f"{prefix}_y") + dy))
+    _overlay_drag["last"] = current
+    callback_overlay_setting_changed(sender, app_data)
+
+def callback_overlay_layout_release(sender, app_data):
+    _overlay_drag.update(name=None, last=None)
+
+def callback_overlay_size_preset(sender, app_data, user_data):
+    name, width, height = user_data
+    prefix = f"ui_overlay_{name}"
+    dpg.set_value(f"{prefix}_width", width)
+    dpg.set_value(f"{prefix}_height", height)
+    callback_overlay_setting_changed(sender, app_data)
+
+def redraw_overlay_previews():
+    """Render the three configured badges inside their vertical GUI sections."""
+    if not dpg.does_item_exist("ui_overlay_recoil_preview"):
+        return
+    config = _overlay_config_from_ui()
+    state = current_overlay_state()
+    for name, badge in config["badges"].items():
+        parent = f"ui_overlay_{name}_preview"
+        dpg.delete_item(parent, children_only=True)
+        active = state[f"{name}_enabled"] if name != "distance" else state["distance_2x"]
+        color = badge["on_color"] if active else badge["off_color"]
+        label = badge["label"]
+        if name == "distance":
+            label += " 2X" if active else " 1X"
+        preview_width = min(300, badge["width"])
+        preview_height = min(65, badge["height"])
+        dpg.draw_rectangle((5, 5), (5 + preview_width, 5 + preview_height),
+                           color=color, fill=color, rounding=5, parent=parent)
+        dpg.draw_text((14, 12), label, color=(255, 255, 255, color[3]),
+                      size=max(10, min(24, int(preview_height * 0.36))), parent=parent)
+    redraw_overlay_layout()
 
 # ---------------------------------------------------------------------------
 # DEVICE UI CALLBACKS
@@ -1052,13 +1537,47 @@ def callback_refresh_com_ports(sender, app_data):
     dpg.configure_item("ui_makcu_com", items=ports)
     if ports: dpg.set_value("ui_makcu_com", ports[0])
 
-def _update_device_status_ui(connected: bool):
+def _update_device_status_ui(connected: bool, message=None):
     txt = "CONNECTED" if connected else "OFFLINE"
     col = (0, 255, 120) if connected else (239, 68, 68)
     dpg.set_value("ui_device_status", txt)
     dpg.configure_item("ui_device_status", color=col)
-    dpg.set_value("ui_device_sidebar", f"  {DEVICE.name()}")
+    sidebar = f"  {DEVICE.name()}" if connected else f"  {DEVICE.name()} OFFLINE"
+    dpg.set_value("ui_device_sidebar", sidebar)
     dpg.configure_item("ui_device_sidebar", color=(0, 191, 255) if connected else (140, 140, 150))
+    if dpg.does_item_exist("ui_device_error"):
+        dpg.set_value("ui_device_error", "" if connected else (message or "Device unavailable"))
+
+def _update_distance_scale_ui(scale_2x_active):
+    """Keep distance status synchronized with runtime and manual changes."""
+    if dpg.does_item_exist("ui_distance_scale_status"):
+        label = "50 m / 2x" if scale_2x_active else "25 m / 1x"
+        color = (255, 190, 60) if scale_2x_active else (0, 200, 120)
+        dpg.set_value("ui_distance_scale_status", label)
+        dpg.configure_item("ui_distance_scale_status", color=color)
+    if dpg.does_item_exist("ui_distance_scale_manual"):
+        dpg.set_value("ui_distance_scale_manual", scale_2x_active)
+    send_overlay_state()
+    redraw_overlay_previews()
+
+def callback_distance_scale_enabled(sender, app_data):
+    ui_thread_push_sync(sender, app_data, "distance_scale_enabled")
+
+def callback_distance_scale_source(sender, app_data):
+    source = app_data or "Local keyboard / pedal"
+    ui_thread_push_sync(sender, source, "distance_scale_source")
+    if dpg.does_item_exist("ui_distance_scale_local_group"):
+        if source == "Local keyboard / pedal":
+            dpg.show_item("ui_distance_scale_local_group")
+        else:
+            dpg.hide_item("ui_distance_scale_local_group")
+
+def callback_distance_scale_manual(sender, app_data):
+    active = bool(app_data)
+    with STATE_LOCK:
+        DEFAULT_STATE["distance_scale_2x_active"] = active
+    ui_thread_push_sync(sender, active, "distance_scale_2x_active")
+    _update_distance_scale_ui(active)
 
 def callback_hw_ks_toggle(sender, app_data):
     with STATE_LOCK: DEFAULT_STATE["hw_killswitch_enabled"] = app_data
@@ -1072,17 +1591,15 @@ def callback_hw_ks_key(sender, app_data):
 _TAB_INFO = {
     "panel_recoil":   ("btn_tab_recoil",   "Recoil Workspace"),
     "panel_burst":    ("btn_tab_burst",    "Burst Mode (93R)"),
-    "panel_settings": ("btn_tab_settings", "Settings Panel")
+    "panel_settings": ("btn_tab_settings", "Settings Panel"),
+    "panel_overlay":  ("btn_tab_overlay",  "Overlay")
 }
 
 def ui_tab_navigation(sender, app_data, user_data):
     # Hide all, show selected
-    for t in ["panel_recoil", "panel_burst", "panel_settings"]: 
+    for t in _TAB_INFO:
         dpg.hide_item(t)
     dpg.show_item(user_data)
-    
-    name = {"panel_recoil": "Recoil", "panel_burst": "Burst", "panel_settings": "Settings"}[user_data]
-    ui_thread_push_sync(None, name, "active_tab")
 
     # Dynamic styling and text shifting (animation)
     for panel, (btn_tag, base_label) in _TAB_INFO.items():
@@ -1099,6 +1616,82 @@ def ui_tab_navigation(sender, app_data, user_data):
 def callback_viewport_resize(sender, app_data):
     if dpg.does_item_exist("shell"):
         dpg.configure_item("shell", width=app_data[0]-15, height=app_data[1]-35)
+
+def add_overlay_badge_section(name, title, badge):
+    """Build one vertically separated badge editor and live preview."""
+    prefix = f"ui_overlay_{name}"
+    with dpg.child_window(height=255, border=True):
+        with dpg.group(horizontal=True):
+            with dpg.group(width=245):
+                with dpg.group(horizontal=True):
+                    dpg.add_text(title.upper(), color=(190, 120, 255))
+                    dpg.add_checkbox(label="Show on overlay", default_value=badge["enabled"],
+                                     tag=f"{prefix}_enabled",
+                                     callback=callback_overlay_setting_changed)
+                dpg.add_drawlist(width=235, height=88, tag=f"{prefix}_preview")
+                dpg.add_input_text(label="Label", default_value=badge["label"], width=125,
+                                   tag=f"{prefix}_label", callback=callback_overlay_setting_changed)
+            dpg.add_spacer(width=8)
+            with dpg.group():
+                dpg.add_text("Placement", color=(140, 140, 150))
+                with dpg.group(horizontal=True):
+                    dpg.add_input_int(label="X", default_value=badge["x"], width=65,
+                                      min_value=0, min_clamped=True, tag=f"{prefix}_x",
+                                      callback=callback_overlay_setting_changed)
+                    dpg.add_input_int(label="Y", default_value=badge["y"], width=65,
+                                      min_value=0, min_clamped=True, tag=f"{prefix}_y",
+                                      callback=callback_overlay_setting_changed)
+                dpg.add_text("Size", color=(140, 140, 150))
+                with dpg.group(horizontal=True):
+                    dpg.add_input_int(label="Width", default_value=badge["width"], width=65,
+                                      min_value=30, min_clamped=True, tag=f"{prefix}_width",
+                                      callback=callback_overlay_setting_changed)
+                    dpg.add_input_int(label="Height", default_value=badge["height"], width=65,
+                                      min_value=16, min_clamped=True, tag=f"{prefix}_height",
+                                      callback=callback_overlay_setting_changed)
+                with dpg.group(horizontal=True):
+                    dpg.add_button(label="Small", width=55, callback=callback_overlay_size_preset,
+                                   user_data=(name, 100, 30))
+                    dpg.add_button(label="Medium", width=60, callback=callback_overlay_size_preset,
+                                   user_data=(name, 150, 42))
+                    dpg.add_button(label="Large", width=55, callback=callback_overlay_size_preset,
+                                   user_data=(name, 220, 60))
+
+        dpg.add_separator()
+        dpg.add_slider_float(
+            label="Transparency (0 invisible / 1 solid)",
+            default_value=_alpha_to_opacity(badge["on_color"][3]),
+            min_value=0.0, max_value=1.0, format="%.2f", width=240,
+            tag=f"{prefix}_opacity", callback=callback_overlay_opacity,
+        )
+        state_labels = (("on", "2x"), ("off", "1x")) if name == "distance" \
+            else (("on", "Enabled"), ("off", "Disabled"))
+        for state_name, label in state_labels:
+            with dpg.group(horizontal=True):
+                dpg.add_text(f"{label}:", color=(140, 140, 150))
+                for palette_name, rgb in OVERLAY_COLOR_PALETTE.items():
+                    dpg.add_color_button(
+                        [*rgb, 255], width=23, height=18, no_border=True,
+                        callback=callback_overlay_palette,
+                        user_data=(name, state_name, rgb),
+                    )
+                    with dpg.tooltip(dpg.last_item()):
+                        dpg.add_text(palette_name)
+
+        with dpg.collapsing_header(label="Advanced custom colors", default_open=False):
+            with dpg.group(horizontal=True):
+                on_label = "2x custom" if name == "distance" else "Enabled custom"
+                off_label = "1x custom" if name == "distance" else "Disabled custom"
+                dpg.add_color_picker(
+                    label=on_label, default_value=badge["on_color"], width=230,
+                    no_alpha=True, display_rgb=True, display_hex=True,
+                    tag=f"{prefix}_on_color", callback=callback_overlay_setting_changed,
+                )
+                dpg.add_color_picker(
+                    label=off_label, default_value=badge["off_color"], width=230,
+                    no_alpha=True, display_rgb=True, display_hex=True,
+                    tag=f"{prefix}_off_color", callback=callback_overlay_setting_changed,
+                )
 
 # ---------------------------------------------------------------------------
 # RUNTIME LIFECYCLE
@@ -1136,6 +1729,7 @@ def start_runtime_workers(stop_event):
 def shutdown_runtime(stop_event, workers):
     """Stop workers before releasing the active hardware device."""
     stop_event.set()
+    stop_overlay()
     for worker in workers:
         worker.join(timeout=WORKER_JOIN_TIMEOUT)
         if worker.is_alive():
@@ -1203,6 +1797,7 @@ def build_tactical_surface():
                 dpg.add_button(tag="btn_tab_recoil",   width=145, height=35, callback=ui_tab_navigation, user_data="panel_recoil")
                 dpg.add_button(tag="btn_tab_burst",    width=145, height=35, callback=ui_tab_navigation, user_data="panel_burst")
                 dpg.add_button(tag="btn_tab_settings", width=145, height=35, callback=ui_tab_navigation, user_data="panel_settings")
+                dpg.add_button(tag="btn_tab_overlay",  width=145, height=35, callback=ui_tab_navigation, user_data="panel_overlay")
                 
                 dpg.add_spacer(height=100)
                 dpg.add_separator()
@@ -1219,7 +1814,8 @@ def build_tactical_surface():
                 dpg.add_text("  Device:")
                 _dev_name  = DEVICE.name()
                 _dev_color = (0, 191, 255) if DEVICE.is_connected() else (140, 140, 150)
-                dpg.add_text(f"  {_dev_name}", tag="ui_device_sidebar", color=_dev_color)
+                _dev_label = f"  {_dev_name}" if DEVICE.is_connected() else f"  {_dev_name} OFFLINE"
+                dpg.add_text(_dev_label, tag="ui_device_sidebar", color=_dev_color)
 
 
             # ── MAIN PANELS ──────────────────────────────────────────────
@@ -1283,6 +1879,27 @@ def build_tactical_surface():
                                                  user_data="recoil_jitter")
 
                     dpg.add_spacer(height=4)
+
+                    with dpg.group(horizontal=True):
+                        dpg.add_checkbox(label="Enable toggle input",
+                                         tag="ui_distance_scale_enabled",
+                                         callback=callback_distance_scale_enabled)
+                        dpg.add_combo(DISTANCE_SCALE_SOURCES,
+                                      default_value="Local keyboard / pedal",
+                                      tag="ui_distance_scale_source", width=155,
+                                      callback=callback_distance_scale_source)
+                        with dpg.group(tag="ui_distance_scale_local_group"):
+                            dpg.add_input_text(default_value="num 1", hint="numpad / pedal key",
+                                               tag="ui_distance_scale_local_key", width=110,
+                                               callback=ui_thread_push_sync,
+                                               user_data="distance_scale_local_key")
+                        dpg.hide_item("ui_distance_scale_local_group")
+                        dpg.add_checkbox(label="2x", tag="ui_distance_scale_manual",
+                                         callback=callback_distance_scale_manual)
+                        dpg.add_text("25 m / 1x", tag="ui_distance_scale_status",
+                                     color=(0, 200, 120))
+                    dpg.add_text("Use a toggle input that does not conflict with Fire or a killswitch.",
+                                 color=(100, 100, 110))
 
                     with dpg.group(horizontal=True):
                         dpg.add_slider_float(label="Interval (s)", default_value=0.15,
@@ -1459,6 +2076,7 @@ def build_tactical_surface():
                         _conn_txt = "CONNECTED" if DEVICE.is_connected() else "OFFLINE"
                         _conn_col = (0, 255, 120) if DEVICE.is_connected() else (239, 68, 68)
                         dpg.add_text(_conn_txt, tag="ui_device_status", color=_conn_col)
+                    dpg.add_text("", tag="ui_device_error", color=(239, 68, 68), wrap=560)
 
                     dpg.add_spacer(height=15)
                     dpg.add_separator()
@@ -1496,10 +2114,78 @@ def build_tactical_surface():
                     dpg.add_combo(KS_KEY_OPTIONS[1:], default_value="Mouse 5",
                                   tag="ui_hw_ks_key_combo", width=160, callback=callback_hw_ks_key)
 
+                # ── OVERLAY TAB ─────────────────────────────────────────
+                with dpg.child_window(tag="panel_overlay", width=-1, height=-1, border=False):
+                    dpg.hide_item("panel_overlay")
+                    dpg.add_text("Fullscreen Display Overlay", color=(145, 55, 240))
+                    dpg.add_separator()
+                    with dpg.group(horizontal=True):
+                        dpg.add_checkbox(label="Overlay enabled", default_value=False,
+                                         tag="ui_overlay_enabled",
+                                         callback=callback_overlay_enabled)
+                        dpg.add_button(label="Start", width=75, callback=callback_overlay_start)
+                        dpg.add_button(label="Stop", width=75, callback=callback_overlay_stop)
+                        dpg.add_button(label="Restart", width=75, callback=callback_overlay_restart)
+                        dpg.add_button(label="Save", width=75, callback=callback_overlay_save)
+                        dpg.add_button(label="Reset", width=75, callback=callback_overlay_reset)
+                        dpg.add_text("STOPPED", tag="ui_overlay_status", color=(140, 140, 150))
+                    with dpg.child_window(height=210, border=True):
+                        dpg.add_text("DISPLAY", color=(190, 120, 255))
+                        with dpg.group(horizontal=True):
+                            dpg.add_combo(["Display Fuser", "Transparent"],
+                                          default_value=OVERLAY_CONFIG["mode"], label="Mode", width=135,
+                                          tag="ui_fullscreen_overlay_mode",
+                                          callback=callback_overlay_setting_changed)
+                            dpg.add_checkbox(label="Always on top", default_value=OVERLAY_CONFIG["always_on_top"],
+                                             tag="ui_overlay_topmost", callback=callback_overlay_setting_changed)
+                            dpg.add_checkbox(label="Click through", default_value=OVERLAY_CONFIG["click_through"],
+                                             tag="ui_overlay_click_through", callback=callback_overlay_setting_changed)
+                        dpg.add_text("Background palette", color=(140, 140, 150))
+                        with dpg.group(horizontal=True):
+                            for palette_name, rgb in OVERLAY_COLOR_PALETTE.items():
+                                dpg.add_color_button([*rgb, 255], width=28, height=20, no_border=True,
+                                                     callback=callback_overlay_background_palette,
+                                                     user_data=rgb)
+                                with dpg.tooltip(dpg.last_item()):
+                                    dpg.add_text(palette_name)
+                            dpg.add_color_edit(label="Custom", default_value=OVERLAY_CONFIG["background_color"],
+                                               width=110, no_alpha=True, tag="ui_overlay_background_color",
+                                               callback=callback_overlay_setting_changed)
+                        dpg.add_slider_float(label="Background opacity", min_value=0.0, max_value=1.0,
+                                             default_value=_alpha_to_opacity(OVERLAY_CONFIG["background_color"][3]),
+                                             format="%.2f", width=220,
+                                             tag="ui_overlay_background_opacity",
+                                             callback=callback_overlay_background_opacity)
+                        with dpg.group(horizontal=True):
+                            dpg.add_combo(OVERLAY_TOGGLE_SOURCES,
+                                          default_value=OVERLAY_CONFIG["toggle_source"],
+                                          label="Toggle source", width=160,
+                                          tag="ui_overlay_toggle_source",
+                                          callback=callback_overlay_toggle_source)
+                            dpg.add_input_text(label="Key / pedal", default_value=OVERLAY_CONFIG["toggle_key"],
+                                               width=70, tag="ui_overlay_toggle_key",
+                                               callback=callback_overlay_setting_changed)
+                            dpg.add_input_text(label="Font file", default_value=OVERLAY_CONFIG["font_path"],
+                                               width=190, readonly=True, tag="ui_overlay_font_path")
+                            dpg.add_button(label="Browse", callback=callback_overlay_font_browse)
+                            dpg.add_slider_float(label="Font scale", default_value=OVERLAY_CONFIG["font_scale"],
+                                                 min_value=0.5, max_value=3.0, width=90,
+                                                 tag="ui_overlay_font_scale",
+                                                 callback=callback_overlay_setting_changed)
+                    dpg.add_text("Right-drag a badge in this scaled screen preview to place it.",
+                                 color=(100, 100, 110))
+                    dpg.add_drawlist(width=OVERLAY_LAYOUT_W, height=OVERLAY_LAYOUT_H,
+                                     tag="ui_overlay_layout")
+                    dpg.add_spacer(height=5)
+                    add_overlay_badge_section("recoil", "Recoil", OVERLAY_CONFIG["badges"]["recoil"])
+                    add_overlay_badge_section("burst", "Burst", OVERLAY_CONFIG["badges"]["burst"])
+                    add_overlay_badge_section("distance", "Distance", OVERLAY_CONFIG["badges"]["distance"])
+
     # -- GLOBAL MOUSE HANDLERS for canvas drag
     with dpg.handler_registry():
         dpg.add_mouse_move_handler(callback=callback_global_mouse_move)
         dpg.add_mouse_release_handler(button=0, callback=callback_global_mouse_release)
+        dpg.add_mouse_release_handler(button=1, callback=callback_overlay_layout_release)
 
 
     # File dialog for .txt pattern import
@@ -1509,6 +2195,12 @@ def build_tactical_surface():
                          tag="import_file_dialog", width=500, height=400):
         dpg.add_file_extension(".txt", color=(0, 200, 120, 255))
         dpg.add_file_extension(".*")
+
+    with dpg.file_dialog(directory_selector=False, show=False,
+                         callback=callback_overlay_font_selected,
+                         tag="overlay_font_dialog", width=520, height=420):
+        dpg.add_file_extension(".ttf", color=(0, 200, 120, 255))
+        dpg.add_file_extension(".otf", color=(0, 170, 235, 255))
 
     dpg.setup_dearpygui()
     dpg.show_viewport()
@@ -1523,6 +2215,7 @@ def build_tactical_surface():
         redraw_recoil_canvas()
         _update_node_info()
         redraw_burst_canvas()
+        redraw_overlay_previews()
 
         # Apply the initial tab styling now that everything is built
         ui_tab_navigation(None, None, "panel_recoil")
@@ -1539,8 +2232,21 @@ def build_tactical_surface():
                         ok = msg[1]
                         dpg.set_value("ui_status_text", "ONLINE" if ok else "PAUSED")
                         dpg.configure_item("ui_status_text", color=(0, 255, 120) if ok else (239, 68, 68))
+                    elif msg[0] == "device_status":
+                        _update_device_status_ui(msg[1], msg[2])
+                    elif msg[0] == "distance_scale":
+                        _update_distance_scale_ui(msg[1])
+                    elif msg[0] == "runtime_state":
+                        send_overlay_state()
+                        redraw_overlay_previews()
+                    elif msg[0] == "overlay_toggle":
+                        if OVERLAY_PROCESS and OVERLAY_PROCESS.is_alive():
+                            stop_overlay()
+                        else:
+                            start_overlay()
                 except queue.Empty:
                     break
+            poll_overlay_status()
     finally:
         shutdown_runtime(stop_event, workers)
         dpg.destroy_context()
