@@ -1975,38 +1975,39 @@ def build_tactical_surface():
 
                     dpg.add_spacer(height=4)
 
-                    with dpg.group(horizontal=True):
-                        dpg.add_checkbox(label="Enable toggle input",
-                                         tag="ui_distance_scale_enabled",
-                                         callback=callback_distance_scale_enabled)
-                        dpg.add_combo(DISTANCE_SCALE_SOURCES,
-                                      default_value="Local keyboard / pedal",
-                                      tag="ui_distance_scale_source", width=155,
-                                      callback=callback_distance_scale_source)
-                        with dpg.group(tag="ui_distance_scale_local_group"):
-                            dpg.add_input_text(default_value="num 1", hint="numpad / pedal key",
-                                               tag="ui_distance_scale_local_key", width=110,
-                                               callback=ui_thread_push_sync,
-                                               user_data="distance_scale_local_key")
-                        dpg.hide_item("ui_distance_scale_local_group")
-                        dpg.add_checkbox(label="Far mode", tag="ui_distance_scale_manual",
-                                         callback=callback_distance_scale_manual)
+                    with dpg.collapsing_header(label="Distance Scaling", default_open=True):
+                        with dpg.group(horizontal=True):
+                            dpg.add_checkbox(label="Enable toggle input",
+                                             tag="ui_distance_scale_enabled",
+                                             callback=callback_distance_scale_enabled)
+                            dpg.add_combo(DISTANCE_SCALE_SOURCES,
+                                          default_value="Local keyboard / pedal",
+                                          tag="ui_distance_scale_source", width=155,
+                                          callback=callback_distance_scale_source)
+                            with dpg.group(tag="ui_distance_scale_local_group"):
+                                dpg.add_input_text(default_value="num 1", hint="numpad / pedal key",
+                                                   tag="ui_distance_scale_local_key", width=110,
+                                                   callback=ui_thread_push_sync,
+                                                   user_data="distance_scale_local_key")
+                            dpg.hide_item("ui_distance_scale_local_group")
+                            dpg.add_checkbox(label="Far mode", tag="ui_distance_scale_manual",
+                                             callback=callback_distance_scale_manual)
                         dpg.add_text("BASE — X 1.00 / Y 1.00", tag="ui_distance_scale_status",
                                      color=(0, 200, 120))
-                    with dpg.group(horizontal=True):
-                        dpg.add_slider_float(label="Far X", default_value=2.0,
-                                             min_value=0.5, max_value=2.5, format="%.2f",
-                                             tag="ui_far_scale_x", width=150,
-                                             callback=callback_far_scale, user_data="far_scale_x")
-                        dpg.add_slider_float(label="Far Y", default_value=2.0,
-                                             min_value=0.5, max_value=2.5, format="%.2f",
-                                             tag="ui_far_scale_y", width=150,
-                                             callback=callback_far_scale, user_data="far_scale_y")
-                        dpg.add_checkbox(label="Link X/Y", default_value=False,
-                                         tag="ui_far_scale_linked",
-                                         callback=callback_far_scale_linked)
-                    dpg.add_text("Use a toggle input that does not conflict with Fire or a killswitch.",
-                                 color=(100, 100, 110))
+                        with dpg.group(horizontal=True):
+                            dpg.add_slider_float(label="Far X", default_value=2.0,
+                                                 min_value=0.5, max_value=2.5, format="%.2f",
+                                                 tag="ui_far_scale_x", width=150,
+                                                 callback=callback_far_scale, user_data="far_scale_x")
+                            dpg.add_slider_float(label="Far Y", default_value=2.0,
+                                                 min_value=0.5, max_value=2.5, format="%.2f",
+                                                 tag="ui_far_scale_y", width=150,
+                                                 callback=callback_far_scale, user_data="far_scale_y")
+                            dpg.add_checkbox(label="Link X/Y", default_value=False,
+                                             tag="ui_far_scale_linked",
+                                             callback=callback_far_scale_linked)
+                        dpg.add_text("Use a toggle input that does not conflict with Fire or a killswitch.",
+                                     color=(100, 100, 110))
 
                     with dpg.group(horizontal=True):
                         dpg.add_slider_float(label="Interval (s)", default_value=0.15,
