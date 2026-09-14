@@ -87,7 +87,7 @@ To ensure proper workspace linkage, the native target link-layer module correspo
 
 The Recoil tab can switch the active profile between its baseline **25 m / 1x** output and **50 m / 2x** output without changing the profile's saved recoil nodes. Enable the toggle input and select either KMBox Mouse 4/5 or a key reported by the control PC, such as `num 1` or a keyboard-emulating foot pedal. Do not assign the same input to firing, a module killswitch, and distance scaling.
 
-KMBox connection, movement, and monitored-button failures are shown as **OFFLINE** in the sidebar. The detailed failure is displayed in the Settings panel.
+KMNet uses UDP, and `kmNet.init()` does not verify that a physical box replied. A successful setup is therefore shown honestly as **READY / UNVERIFIED**, not connected. Native initialization, movement, and monitored-button failures are shown as **OFFLINE**; details appear in Settings.
 
 ### Fullscreen Overlay
 

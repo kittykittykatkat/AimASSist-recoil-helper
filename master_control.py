@@ -59,10 +59,14 @@ class KMBoxDevice(HWDevice):
             post_device_status(False, message)
             return False
         try:
-            km.init(ip, port, device_id)
-            km.monitor(int(monitor_port))
+            init_result = km.init(ip, port, device_id)
+            if init_result != 0:
+                raise RuntimeError(f"kmNet init returned {init_result}")
+            monitor_result = km.monitor(int(monitor_port))
+            if monitor_result not in (None, 0):
+                raise RuntimeError(f"kmNet monitor returned {monitor_result}")
             self._ok = True
-            logging.info(f"KMBox connected: {ip}:{port}")
+            logging.info(f"KMBox ready (UDP unverified): {ip}:{port}")
             return True
         except Exception as e:
             self._ok = False
@@ -313,6 +317,10 @@ OVERLAY_CONFIG = load_overlay_config()
 OVERLAY_PROCESS = None
 OVERLAY_COMMAND_QUEUE = None
 OVERLAY_STATUS_QUEUE = None
+OVERLAY_PENDING_UPDATES = {}
+DEVICE_CONNECT_LOCK = threading.Lock()
+DEVICE_CONNECT_COOLDOWN = 1.0
+_last_device_connect_time = 0.0
 
 OVERLAY_COLOR_PALETTE = {
     "Green":  [0, 210, 120],
@@ -1186,11 +1194,32 @@ def current_overlay_state():
         }
 
 def send_overlay_state():
-    if OVERLAY_PROCESS and OVERLAY_PROCESS.is_alive() and OVERLAY_COMMAND_QUEUE:
+    queue_overlay_update("state", current_overlay_state())
+
+def queue_overlay_update(kind, payload):
+    """Queue an overlay update or retain its latest value for the next frame."""
+    if not (OVERLAY_PROCESS and OVERLAY_PROCESS.is_alive() and OVERLAY_COMMAND_QUEUE):
+        return False
+    try:
+        OVERLAY_COMMAND_QUEUE.put_nowait((kind, payload))
+        OVERLAY_PENDING_UPDATES.pop(kind, None)
+        return True
+    except queue.Full:
+        OVERLAY_PENDING_UPDATES[kind] = payload
+        return False
+
+def flush_overlay_updates():
+    """Deliver coalesced updates without blocking DearPyGui's render loop."""
+    if not (OVERLAY_PROCESS and OVERLAY_PROCESS.is_alive() and OVERLAY_COMMAND_QUEUE):
+        OVERLAY_PENDING_UPDATES.clear()
+        return
+    for kind, payload in list(OVERLAY_PENDING_UPDATES.items()):
         try:
-            OVERLAY_COMMAND_QUEUE.put_nowait(("state", current_overlay_state()))
+            OVERLAY_COMMAND_QUEUE.put_nowait((kind, payload))
         except queue.Full:
-            logging.warning("Overlay state update dropped")
+            break
+        else:
+            OVERLAY_PENDING_UPDATES.pop(kind, None)
 
 def start_overlay():
     """Start the isolated renderer using current validated settings."""
@@ -1214,6 +1243,7 @@ def start_overlay():
 def stop_overlay():
     """Request renderer shutdown and terminate only if it cannot exit promptly."""
     global OVERLAY_PROCESS, OVERLAY_COMMAND_QUEUE, OVERLAY_STATUS_QUEUE
+    OVERLAY_PENDING_UPDATES.clear()
     process = OVERLAY_PROCESS
     if not process:
         _set_overlay_enabled_ui(False)
@@ -1334,10 +1364,7 @@ def callback_overlay_setting_changed(sender, app_data):
     OVERLAY_CONFIG = _overlay_config_from_ui()
     redraw_overlay_previews()
     if OVERLAY_PROCESS and OVERLAY_PROCESS.is_alive() and OVERLAY_COMMAND_QUEUE:
-        try:
-            OVERLAY_COMMAND_QUEUE.put_nowait(("config", OVERLAY_CONFIG))
-        except queue.Full:
-            logging.warning("Overlay config update dropped")
+        queue_overlay_update("config", OVERLAY_CONFIG)
 
 def callback_overlay_save(sender, app_data):
     global OVERLAY_CONFIG
@@ -1519,6 +1546,15 @@ def callback_device_type_changed(sender, app_data):
     dpg.show_item("grp_makcu") if t == "Makcu" else dpg.hide_item("grp_makcu")
 
 def callback_device_connect(sender, app_data):
+    global _last_device_connect_time
+    now = time.monotonic()
+    if now - _last_device_connect_time < DEVICE_CONNECT_COOLDOWN:
+        return
+    if not DEVICE_CONNECT_LOCK.acquire(blocking=False):
+        return
+    _last_device_connect_time = now
+    if dpg.does_item_exist("ui_device_connect"):
+        dpg.configure_item("ui_device_connect", enabled=False)
     cfg = {
         "device_type":   dpg.get_value("ui_device_type"),
         "kmbox_ip":      dpg.get_value("ui_kmbox_ip"),
@@ -1528,9 +1564,14 @@ def callback_device_connect(sender, app_data):
         "makcu_com":     dpg.get_value("ui_makcu_com"),
         "makcu_baud":    dpg.get_value("ui_makcu_baud"),
     }
-    success = connect_device_from_config(cfg)
-    save_device_config(cfg)
-    _update_device_status_ui(success)
+    try:
+        success = connect_device_from_config(cfg)
+        save_device_config(cfg)
+        _update_device_status_ui(success)
+    finally:
+        DEVICE_CONNECT_LOCK.release()
+        if dpg.does_item_exist("ui_device_connect"):
+            dpg.configure_item("ui_device_connect", enabled=True)
 
 def callback_refresh_com_ports(sender, app_data):
     ports = get_available_com_ports()
@@ -1538,13 +1579,22 @@ def callback_refresh_com_ports(sender, app_data):
     if ports: dpg.set_value("ui_makcu_com", ports[0])
 
 def _update_device_status_ui(connected: bool, message=None):
-    txt = "CONNECTED" if connected else "OFFLINE"
-    col = (0, 255, 120) if connected else (239, 68, 68)
+    is_kmbox = isinstance(DEVICE, KMBoxDevice)
+    txt = "READY / UNVERIFIED" if connected and is_kmbox else ("CONNECTED" if connected else "OFFLINE")
+    col = (255, 190, 60) if connected and is_kmbox else (
+        (0, 255, 120) if connected else (239, 68, 68)
+    )
     dpg.set_value("ui_device_status", txt)
     dpg.configure_item("ui_device_status", color=col)
-    sidebar = f"  {DEVICE.name()}" if connected else f"  {DEVICE.name()} OFFLINE"
+    if connected and is_kmbox:
+        sidebar = f"  {DEVICE.name()} READY"
+    else:
+        sidebar = f"  {DEVICE.name()}" if connected else f"  {DEVICE.name()} OFFLINE"
     dpg.set_value("ui_device_sidebar", sidebar)
-    dpg.configure_item("ui_device_sidebar", color=(0, 191, 255) if connected else (140, 140, 150))
+    sidebar_color = (255, 190, 60) if connected and is_kmbox else (
+        (0, 191, 255) if connected else (140, 140, 150)
+    )
+    dpg.configure_item("ui_device_sidebar", color=sidebar_color)
     if dpg.does_item_exist("ui_device_error"):
         dpg.set_value("ui_device_error", "" if connected else (message or "Device unavailable"))
 
@@ -2071,11 +2121,22 @@ def build_tactical_surface():
 
                     dpg.add_spacer(height=8)
                     with dpg.group(horizontal=True):
-                        dpg.add_button(label="Connect / Reconnect", width=160, callback=callback_device_connect)
+                        dpg.add_button(label="Initialize / Reinitialize", width=180,
+                                       tag="ui_device_connect", callback=callback_device_connect)
                         dpg.add_spacer(width=10)
-                        _conn_txt = "CONNECTED" if DEVICE.is_connected() else "OFFLINE"
-                        _conn_col = (0, 255, 120) if DEVICE.is_connected() else (239, 68, 68)
+                        _conn_txt = (
+                            "READY / UNVERIFIED"
+                            if isinstance(DEVICE, KMBoxDevice) and DEVICE.is_connected()
+                            else ("CONNECTED" if DEVICE.is_connected() else "OFFLINE")
+                        )
+                        _conn_col = (
+                            (255, 190, 60)
+                            if isinstance(DEVICE, KMBoxDevice) and DEVICE.is_connected()
+                            else ((0, 255, 120) if DEVICE.is_connected() else (239, 68, 68))
+                        )
                         dpg.add_text(_conn_txt, tag="ui_device_status", color=_conn_col)
+                    dpg.add_text("KMNet uses UDP; initialization cannot prove the box replied.",
+                                 color=(100, 100, 110))
                     dpg.add_text("", tag="ui_device_error", color=(239, 68, 68), wrap=560)
 
                     dpg.add_spacer(height=15)
@@ -2247,6 +2308,7 @@ def build_tactical_surface():
                 except queue.Empty:
                     break
             poll_overlay_status()
+            flush_overlay_updates()
     finally:
         shutdown_runtime(stop_event, workers)
         dpg.destroy_context()

@@ -219,6 +219,66 @@ def test_reconnect_disconnects_previous_device(monkeypatch):
     assert master_control.DEVICE is replacement
 
 
+def test_kmbox_nonzero_init_result_is_not_ready(monkeypatch):
+    class FailedKMNet:
+        @staticmethod
+        def init(ip, port, device_id):
+            return -1
+
+        @staticmethod
+        def monitor(port):
+            raise AssertionError("monitor must not run after failed init")
+
+    drain_ui_updates()
+    monkeypatch.setattr(master_control, "km", FailedKMNet())
+    monkeypatch.setattr(master_control, "KM_AVAILABLE", True)
+    device = master_control.KMBoxDevice()
+
+    assert not device.connect()
+    assert not device.is_connected()
+
+
+def test_kmbox_zero_results_mark_udp_ready(monkeypatch):
+    class ReadyKMNet:
+        @staticmethod
+        def init(ip, port, device_id):
+            return 0
+
+        @staticmethod
+        def monitor(port):
+            return 0
+
+    monkeypatch.setattr(master_control, "km", ReadyKMNet())
+    monkeypatch.setattr(master_control, "KM_AVAILABLE", True)
+    device = master_control.KMBoxDevice()
+
+    assert device.connect()
+    assert device.is_connected()
+
+
+def test_overlay_updates_coalesce_when_command_queue_is_full(monkeypatch):
+    class RunningProcess:
+        @staticmethod
+        def is_alive():
+            return True
+
+    command_queue = queue.Queue(maxsize=1)
+    command_queue.put_nowait(("state", {"old": True}))
+    monkeypatch.setattr(master_control, "OVERLAY_PROCESS", RunningProcess())
+    monkeypatch.setattr(master_control, "OVERLAY_COMMAND_QUEUE", command_queue)
+    master_control.OVERLAY_PENDING_UPDATES.clear()
+
+    assert not master_control.queue_overlay_update("config", {"version": 1})
+    assert not master_control.queue_overlay_update("config", {"version": 2})
+    assert master_control.OVERLAY_PENDING_UPDATES == {"config": {"version": 2}}
+
+    assert command_queue.get_nowait() == ("state", {"old": True})
+    master_control.flush_overlay_updates()
+
+    assert command_queue.get_nowait() == ("config", {"version": 2})
+    assert not master_control.OVERLAY_PENDING_UPDATES
+
+
 def test_kmbox_move_failure_posts_offline_status(monkeypatch):
     class FailingKMNet:
         @staticmethod
