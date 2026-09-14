@@ -302,6 +302,9 @@ DEFAULT_STATE = {
     "distance_scale_source":    "Local keyboard / pedal",
     "distance_scale_local_key": "num 1",
     "distance_scale_2x_active": False,
+    "far_scale_x":              2.0,
+    "far_scale_y":              2.0,
+    "far_scale_linked":         False,
 
     "burst_count":           3,
     "burst_y_pull":          14.0,
@@ -439,9 +442,15 @@ def select_runtime_mode(state, recoil_triggered, burst_triggered, ads, burst_in_
         return "Burst", burst_ready
     return "None", False
 
-def get_distance_scale_multiplier(scale_2x_active):
-    """Return the runtime recoil multiplier for the selected distance mode."""
-    return 2.0 if scale_2x_active else 1.0
+def get_far_scale_multipliers(far_mode_active, far_scale_x, far_scale_y):
+    """Return independent runtime recoil multipliers for base or Far mode."""
+    if not far_mode_active:
+        return 1.0, 1.0
+    return far_scale_x, far_scale_y
+
+def snap_far_scale(value):
+    """Clamp Far-mode recoil scaling to 0.05 increments."""
+    return round(max(0.5, min(2.5, round(float(value) / 0.05) * 0.05)), 2)
 
 def update_distance_scale_latch(scale_2x_active, pressed, previously_pressed):
     """Toggle distance scale once on each input press edge."""
@@ -483,6 +492,9 @@ def callback_save_config(sender, app_data):
         "distance_scale_enabled": dpg.get_value("ui_distance_scale_enabled"),
         "distance_scale_source":  dpg.get_value("ui_distance_scale_source"),
         "distance_scale_local_key": dpg.get_value("ui_distance_scale_local_key"),
+        "far_scale_x":            dpg.get_value("ui_far_scale_x"),
+        "far_scale_y":            dpg.get_value("ui_far_scale_y"),
+        "far_scale_linked":       dpg.get_value("ui_far_scale_linked"),
         "recoil_nodes":           DEFAULT_STATE["recoil_nodes"],
         "burst_count":            dpg.get_value("ui_burst_count"),
         "burst_y_pull":           dpg.get_value("ui_burst_pull"),
@@ -525,6 +537,12 @@ def callback_load_config(sender, app_data):
         dpg.set_value("ui_distance_scale_enabled", data.get("distance_scale_enabled", False))
         dpg.set_value("ui_distance_scale_source", data.get("distance_scale_source", "Local keyboard / pedal"))
         dpg.set_value("ui_distance_scale_local_key", data.get("distance_scale_local_key", "num 1"))
+        dpg.set_value("ui_far_scale_x",          data.get("far_scale_x", 2.0))
+        dpg.set_value("ui_far_scale_y",          data.get("far_scale_y", 2.0))
+        dpg.set_value("ui_far_scale_linked",     data.get("far_scale_linked", False))
+        data["far_scale_x"] = data.get("far_scale_x", 2.0)
+        data["far_scale_y"] = data.get("far_scale_y", 2.0)
+        data["far_scale_linked"] = data.get("far_scale_linked", False)
         callback_distance_scale_source(None, data.get("distance_scale_source", "Local keyboard / pedal"))
         dpg.set_value("ui_burst_count",          data.get("burst_count",        3))
         dpg.set_value("ui_burst_pull",           data.get("burst_y_pull",       14.0))
@@ -745,9 +763,11 @@ def hardware_consumer_engine(data_mailbox, stop_event=None):
                         recoil_trigger_latch = True
                         start_burst_time     = now
                     vx, vy = get_interpolated_velocity(now - start_burst_time, _nodes_sorted)
-                    distance_mod = get_distance_scale_multiplier(rs["distance_scale_2x_active"])
-                    fx = vx * rs["recoil_scale_x"] * distance_mod * fov_mod * sens_mod
-                    fy = vy * rs["recoil_scale_y"] * distance_mod * fov_mod * sens_mod
+                    far_x, far_y = get_far_scale_multipliers(
+                        rs["distance_scale_2x_active"], rs["far_scale_x"], rs["far_scale_y"]
+                    )
+                    fx = vx * rs["recoil_scale_x"] * far_x * fov_mod * sens_mod
+                    fy = vy * rs["recoil_scale_y"] * far_y * fov_mod * sens_mod
                     if rs["recoil_jitter"] > 0:
                         fx += random.uniform(-rs["recoil_jitter"], rs["recoil_jitter"]) * 5
                     accum_x += fx; accum_y += fy
@@ -1601,7 +1621,9 @@ def _update_device_status_ui(connected: bool, message=None):
 def _update_distance_scale_ui(scale_2x_active):
     """Keep distance status synchronized with runtime and manual changes."""
     if dpg.does_item_exist("ui_distance_scale_status"):
-        label = "50 m / 2x" if scale_2x_active else "25 m / 1x"
+        far_x = dpg.get_value("ui_far_scale_x") if dpg.does_item_exist("ui_far_scale_x") else 2.0
+        far_y = dpg.get_value("ui_far_scale_y") if dpg.does_item_exist("ui_far_scale_y") else 2.0
+        label = f"FAR — X {far_x:.2f} / Y {far_y:.2f}" if scale_2x_active else "BASE — X 1.00 / Y 1.00"
         color = (255, 190, 60) if scale_2x_active else (0, 200, 120)
         dpg.set_value("ui_distance_scale_status", label)
         dpg.configure_item("ui_distance_scale_status", color=color)
@@ -1627,6 +1649,29 @@ def callback_distance_scale_manual(sender, app_data):
     with STATE_LOCK:
         DEFAULT_STATE["distance_scale_2x_active"] = active
     ui_thread_push_sync(sender, active, "distance_scale_2x_active")
+    _update_distance_scale_ui(active)
+
+def callback_far_scale(sender, app_data, user_data):
+    """Update a Far axis, optionally mirroring it to the linked axis."""
+    value = snap_far_scale(app_data)
+    dpg.set_value(sender, value)
+    other_key = "far_scale_y" if user_data == "far_scale_x" else "far_scale_x"
+    ui_thread_push_sync(sender, value, user_data)
+    if dpg.get_value("ui_far_scale_linked"):
+        dpg.set_value(f"ui_{other_key}", value)
+        ui_thread_push_sync(sender, value, other_key)
+    with STATE_LOCK:
+        active = DEFAULT_STATE["distance_scale_2x_active"]
+    _update_distance_scale_ui(active)
+
+def callback_far_scale_linked(sender, app_data):
+    ui_thread_push_sync(sender, bool(app_data), "far_scale_linked")
+    if app_data:
+        value = snap_far_scale(dpg.get_value("ui_far_scale_x"))
+        dpg.set_value("ui_far_scale_y", value)
+        ui_thread_push_sync(sender, value, "far_scale_y")
+    with STATE_LOCK:
+        active = DEFAULT_STATE["distance_scale_2x_active"]
     _update_distance_scale_ui(active)
 
 def callback_hw_ks_toggle(sender, app_data):
@@ -1944,10 +1989,22 @@ def build_tactical_surface():
                                                callback=ui_thread_push_sync,
                                                user_data="distance_scale_local_key")
                         dpg.hide_item("ui_distance_scale_local_group")
-                        dpg.add_checkbox(label="2x", tag="ui_distance_scale_manual",
+                        dpg.add_checkbox(label="Far mode", tag="ui_distance_scale_manual",
                                          callback=callback_distance_scale_manual)
-                        dpg.add_text("25 m / 1x", tag="ui_distance_scale_status",
+                        dpg.add_text("BASE — X 1.00 / Y 1.00", tag="ui_distance_scale_status",
                                      color=(0, 200, 120))
+                    with dpg.group(horizontal=True):
+                        dpg.add_slider_float(label="Far X", default_value=2.0,
+                                             min_value=0.5, max_value=2.5, format="%.2f",
+                                             tag="ui_far_scale_x", width=150,
+                                             callback=callback_far_scale, user_data="far_scale_x")
+                        dpg.add_slider_float(label="Far Y", default_value=2.0,
+                                             min_value=0.5, max_value=2.5, format="%.2f",
+                                             tag="ui_far_scale_y", width=150,
+                                             callback=callback_far_scale, user_data="far_scale_y")
+                        dpg.add_checkbox(label="Link X/Y", default_value=False,
+                                         tag="ui_far_scale_linked",
+                                         callback=callback_far_scale_linked)
                     dpg.add_text("Use a toggle input that does not conflict with Fire or a killswitch.",
                                  color=(100, 100, 110))
 

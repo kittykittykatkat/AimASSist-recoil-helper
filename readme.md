@@ -83,9 +83,9 @@ To ensure proper workspace linkage, the native target link-layer module correspo
 4.  **Hardware Killswitch** - Map a mouse button (e.g., `Mouse 5`) to instantly kill or wake the device's hardware inputs.
 5.  **Panic Key** - Map a local keyboard hotkey (e.g., `/`, foot pedals, a controller paddle etc) as a background safety override to instantly pause the entire framework across the dual-PC setup.
 
-### Distance Scale
+### Far Recoil Scale
 
-The Recoil tab can switch the active profile between its baseline **25 m / 1x** output and **50 m / 2x** output without changing the profile's saved recoil nodes. Enable the toggle input and select either KMBox Mouse 4/5 or a key reported by the control PC, such as `num 1` or a keyboard-emulating foot pedal. Do not assign the same input to firing, a module killswitch, and distance scaling.
+The Recoil tab can switch between the profile's **Base** output and a configurable **Far mode** without changing its saved recoil nodes. Far X and Far Y multipliers are independent, range from `0.50` to `2.50`, and snap to `0.05` increments. Link X/Y when both axes should move together. Existing profiles fall back to `2.00 / 2.00`; saving a profile stores its Far settings. The toggle input can use KMBox Mouse 4/5, a control-PC key such as `num 1`, or a keyboard-emulating foot pedal. Do not reuse the firing or killswitch input.
 
 KMNet uses UDP, and `kmNet.init()` does not verify that a physical box replied. A successful setup is therefore shown honestly as **READY / UNVERIFIED**, not connected. Native initialization, movement, and monitored-button failures are shown as **OFFLINE**; details appear in Settings.
 

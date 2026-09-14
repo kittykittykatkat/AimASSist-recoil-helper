@@ -116,9 +116,15 @@ def test_recoil_has_priority_when_both_modules_trigger():
     assert (mode, is_firing) == ("Recoil", True)
 
 
-def test_distance_scale_multiplier_switches_between_1x_and_2x():
-    assert master_control.get_distance_scale_multiplier(False) == 1.0
-    assert master_control.get_distance_scale_multiplier(True) == 2.0
+def test_far_scale_uses_independent_axes_only_in_far_mode():
+    assert master_control.get_far_scale_multipliers(False, 1.1, 1.45) == (1.0, 1.0)
+    assert master_control.get_far_scale_multipliers(True, 1.1, 1.45) == (1.1, 1.45)
+
+
+def test_far_scale_snaps_and_clamps():
+    assert master_control.snap_far_scale(0.1) == 0.5
+    assert master_control.snap_far_scale(1.43) == 1.45
+    assert master_control.snap_far_scale(3.0) == 2.5
 
 
 def test_overlay_opacity_snaps_to_five_percent_steps():
