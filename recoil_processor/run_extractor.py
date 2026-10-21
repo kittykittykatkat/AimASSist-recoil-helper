@@ -80,7 +80,8 @@ class Viewport:
     def zoom_at(self, sx, sy, zin=True):
         ix, iy = self.s2i(sx, sy)
         self.zoom = min(self.zoom * 1.2, 20.0) if zin else max(self.zoom / 1.2, 0.1)
-        self.cx, self.cy = ix, iy
+        self.cx = ix - (sx - self.sw / 2) / self.zoom
+        self.cy = iy - (sy - self.view_h / 2) / self.zoom
         self._clamp()
 
     def pan(self, dx_s, dy_s):
@@ -97,8 +98,8 @@ class Viewport:
     def _clamp(self):
         hw = (self.sw / self.zoom) / 2
         hh = (self.view_h / self.zoom) / 2
-        self.cx = max(hw, min(self.iw - hw, self.cx))
-        self.cy = max(hh, min(self.ih - hh, self.cy))
+        self.cx = self.iw / 2 if 2 * hw >= self.iw else max(hw, min(self.iw - hw, self.cx))
+        self.cy = self.ih / 2 if 2 * hh >= self.ih else max(hh, min(self.ih - hh, self.cy))
 
     def s2i(self, sx, sy):
         off_x = self.cx - (self.sw / self.zoom) / 2
@@ -108,36 +109,19 @@ class Viewport:
     def i2s(self, ix, iy):
         off_x = self.cx - (self.sw / self.zoom) / 2
         off_y = self.cy - (self.view_h / self.zoom) / 2
-        return int((ix - off_x) * self.zoom), int((iy - off_y) * self.zoom)
+        return round((ix - off_x) * self.zoom), round((iy - off_y) * self.zoom)
 
     def render(self, img):
-        half_w = (self.sw / self.zoom) / 2
-        half_h = (self.view_h / self.zoom) / 2
-        src_x1 = max(0, int(self.cx - half_w))
-        src_y1 = max(0, int(self.cy - half_h))
-        src_x2 = min(self.iw, int(self.cx + half_w))
-        src_y2 = min(self.ih, int(self.cy + half_h))
-
-        crop = img[src_y1:src_y2, src_x1:src_x2]
-        if crop.size == 0:
-            return np.zeros((self.view_h, self.sw, 3), dtype=np.uint8)
-
-        dst_w = int((src_x2 - src_x1) * self.zoom)
-        dst_h = int((src_y2 - src_y1) * self.zoom)
-        if dst_w < 1 or dst_h < 1:
-            return np.zeros((self.view_h, self.sw, 3), dtype=np.uint8)
-
-        scaled = cv2.resize(crop, (dst_w, dst_h), interpolation=
-                            cv2.INTER_NEAREST if self.zoom > 3 else cv2.INTER_LINEAR)
-
-        canvas = np.zeros((self.view_h, self.sw, 3), dtype=np.uint8)
-        ox = max(0, (self.sw - dst_w) // 2)
-        oy = max(0, (self.view_h - dst_h) // 2)
-        paste_w = min(dst_w, self.sw - ox)
-        paste_h = min(dst_h, self.view_h - oy)
-        canvas[oy:oy+paste_h, ox:ox+paste_w] = scaled[:paste_h, :paste_w]
-
-        return canvas
+        """Render using the same affine mapping as clicks and marker placement."""
+        transform = np.array([
+            [self.zoom, 0, self.sw / 2 - self.cx * self.zoom],
+            [0, self.zoom, self.view_h / 2 - self.cy * self.zoom],
+        ], dtype=np.float64)
+        return cv2.warpAffine(
+            img, transform, (self.sw, self.view_h),
+            flags=cv2.INTER_NEAREST if self.zoom > 3 else cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0),
+        )
 
 
 def draw_markers(frame, clicks, vp):

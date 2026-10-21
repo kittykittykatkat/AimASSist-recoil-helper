@@ -85,6 +85,8 @@ The tool uses `inputs`/`outputs` relative to its **working directory**. Put scre
 
 Left-click marks; wheel zooms; middle-drag/arrows pan; F fits; Z undoes; C clears; Q/Enter exports; Escape cancels. Normal extraction retains its wall-scalar conversion and plain-text output. Use **Import .txt** in Master Control and set the matching interval for normal files.
 
+Rendering, marker placement and clicks use the same image transform. Wheel zoom preserves the image point under the cursor except where image-edge bounds require clamping; letterboxed images remain centered while panning.
+
 ### Optional SHAK mode
 
 Choose **SHAK** in the same menu and enter measured milliseconds **between trigger pulls**, not between simultaneous projectiles. No rate is assumed.
