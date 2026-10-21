@@ -1,122 +1,156 @@
 # AimASSist Control Workspace
 
-An independent, low-latency client application built for the mentally retarded and physically disabled with [DearPyGui](https://github.com/hoffstadt/DearPyGui) for Dual-PC (2PC) topologies. This environment executes entirely on a secondary stream/control machine, routing mouse translation coordinates and click sequences directly to a physical KMBox processing unit over UDP.
+Windows/DearPyGui application for editable movement profiles, Linear corrections, Burst compensation and a fullscreen status overlay. KMBox Net output runs from a secondary/control PC. Simulation generates no hardware output.
 
-By offloading the entire execution environment, configuration tables, and input pooling tasks, the script completely isolates execution signatures from the target gaming PC, rendering it **almost** entirely invisible to input heuristics. 
+Originally calibrated for **THE FINALS**. CS2, WARDOGS and generic game setups are planned, not implemented calibration presets. Current engines provide movement, not memory reading, target detection or automatic firing. Hardware use does not guarantee undetectability or compliance with game rules.
 
-Originally configured for the specific frame pacing and recoil mechanics of *The Finals*, the software layer is built using an open device abstraction layer, allowing seamless adaptability for any competitive first-person shooter environment.
+## Installation
 
-> [!IMPORTANT]
-> The finals is filled with cheats so you might as well join in. Huge shoutout to the "pillars of the finals community" and **"Embark Partners"** who cheat & stream on twitch with a dma setup @lycommit and his cheater trio stack. larp harder loser! dia+ is like half cheaters LMAO
+The bundled `kmNet.cp311-win_amd64.pyd` requires **Windows, 64-bit Python 3.11**. From the repository root:
 
----
-### GUI Design
- [![Alt Text](images/GUI.png)]()
- [![m11](images/m11.png)]()m11 @25m
-
- [![xp54](images/xp54.png)]()xp54 @25m
-
- [![Alt Text](images/lewis.png)]() lewis @20m
- 
- [![p90 script on](images/p90_ON.gif)]()
-
-
-## Prerequisites & Initial Provisioning
-
-- A KMBox B/Net for hardware output, or Simulation mode for testing
-- A laptop or miniPC
-
-### Host Environment Requirements
-
-The bundled `kmNet.cp311-win_amd64.pyd` requires **64-bit Python 3.11 on Windows**. Install the application dependencies, then start the GUI from the repository root:
-
-```bash
+```powershell
 python -m pip install -r requirements.txt
 python master_control.py
 ```
 
-The standalone recoil profile tool additionally uses OpenCV and NumPy:
+| Backend | Status |
+| --- | --- |
+| KMBox Net | Native integration; use the actual box IP, port, ID and monitor port |
+| Simulation | No hardware output; local input for development |
+| Makcu | Unfinished placeholder, not a working supported backend |
 
-```bash
+KMBox B compatibility is not established. Do not substitute native binaries without checking API and Python ABI compatibility.
+
+## First run
+
+1. Use Simulation to check the GUI without hardware.
+2. For KMBox Net, enter device settings and choose **Connect**. Runtime connection requests run on the hardware worker.
+3. Load a weapon profile or import a pattern.
+4. Match sensitivity, ADS multiplier and FOV to the calibration used for that profile.
+5. Configure trigger, ADS requirement and killswitch; avoid conflicting button assignments.
+6. Check Master state before expecting output. Changing tabs does not disable modules.
+
+Device settings live in `device.json`; profiles live in `configs`. Keep real device IDs out of shared commits and screenshots.
+
+## Master and keyboard scope
+
+The local Master hotkey defaults to `/`; Settings also offers F4, Insert and Home. It toggles active/paused, not application exit.
+
+**Local keyboard and keyboard-emulating pedal inputs are read on the control PC.** Main-PC keys are not visible unless explicitly routed there. KMBox sources depend on inputs monitored through the box. Local overlay F8 has the same control-PC restriction.
+
+## Movement workspaces
+
+### Pattern recoil
+
+Use **Recoil Workspace** to import or edit timed X/Y nodes. Add/select/drag/delete nodes, adjust interval and base scales, and configure trigger, ADS requirement and latch behavior. Existing Pattern math is retained; scheduler-independent timing is not guaranteed.
+
+### Linear
+
+Open **Linear Workspace**, below Recoil Workspace. **Linear** also appears beneath Recoil in **Mod links**; both checkboxes are synchronized.
+
+Pattern and Linear are mutually exclusive: enabling Linear switches away from Pattern; enabling Recoil selects Pattern. Navigation alone does not switch engines. Older profiles default to Pattern.
+
+| Behavior | X/Y meaning |
+| --- | --- |
+| Single correction | Total movement once per activation |
+| Smooth correction | Total movement distributed over a duration |
+| Continuous pull | Movement per second while active |
+| Repeat while held | One correction per repeat interval |
+
+Start delay and retrigger cooldown are configurable. Duration/repeat fields appear only for the relevant behavior. Ctrl+click sliders for exact entry. Negative X is left, positive X right; negative Y is up, positive Y down.
+
+Linear shares Recoil trigger, ADS requirement, killswitch, sensitivity and base/Far scaling. Smooth correction stops on release. With latch enabled, activation follows the latched state, not physical release. Editing settings cancels Linear until release. Engine switches/recovery require release/repress when held. Missed repeats are skipped; continuous catch-up is capped at 50 ms. No clicks are generated.
+
+### Burst
+
+Timed groups of X/Y movement corrections with count, intra-group interval and recovery interval. Burst does not fire automatically. Recoil takes priority if both module triggers activate together.
+
+### Distance Scaling / Far mode
+
+Expand **Distance Scaling** in Recoil Workspace. Far X/Y are independent `0.50–2.50` multipliers in `0.05` steps; Link X/Y changes both together. Base uses 1.00. Switch manually or with a configured local keyboard/pedal or KMBox Mouse 4/5 input.
+
+These are **scale presets, not distance detection**. Multiplying by two does not universally convert 25 m calibration to 50 m. Older profiles default to Far 2.00/2.00, unlinked; profile load resets active Far to Base. The overlay retains legacy 1X/2X labels rather than displaying custom Far values.
+
+## Current fullscreen extractor
+
+From the repository root:
+
+```powershell
 python -m pip install -r requirements-tools.txt
-python recoil_processor/profile_architect.py --weapon AKM --sens 22 --fov 100
+Set-Location recoil_processor
+python run_extractor.py
 ```
 
-### Module File Layout
+The tool uses `inputs`/`outputs` relative to its **working directory**. Put screenshots in `recoil_processor/inputs`; the newest PNG/JPG/JPEG is selected. Choose weapon and wall scalar in the console before fullscreen opens.
 
-To ensure proper workspace linkage, the native target link-layer module corresponding to your network hardware (`kmNet`) must reside directly within the immediate directory structure:
+Left-click marks; wheel zooms; middle-drag/arrows pan; F fits; Z undoes; C clears; Q/Enter exports; Escape cancels. Normal extraction retains its wall-scalar conversion and plain-text output. Use **Import .txt** in Master Control and set the matching interval for normal files.
 
-```
-|recoil_processor|
-├── profile_architect.py # Manual image-to-pattern tool
-├── inputs/image.png
-├── outputs/weaponname_profile.txt
+### Optional SHAK mode
 
-|AimASSist|
-├── configs/           # Serialized JSON configuration profiles
-├── overlay.json       # Fullscreen overlay appearance and placement
-├── overlay_renderer.py# Isolated fullscreen renderer
-├── kmNet.cp311-win_amd64.pyd # Native KMBox module for Python 3.11
-└── master_control.py  # Primary runtime interface and worker engine
-```
+Choose **SHAK** in the same menu and enter measured milliseconds **between trigger pulls**, not between simultaneous projectiles. No rate is assumed.
 
----
+1. Click the original aim point as the separate origin.
+2. Click both impacts from the first trigger pull.
+3. Continue pairs in firing order.
+4. Review pair lines, widths and midpoint trajectory before exporting.
 
-## Workspace Features
+Each pair uses its actual X/Y midpoint, regardless of separation. Midpoint correction cannot remove projectile spread. Use one capture distance. If 20 rounds are consumed two per trigger, a magazine gives 10 pairs.
 
-### Vector Recoil Matrix
+Z removes individual impacts, then origin; C resets all. An origin plus one complete pair is the minimum. Incomplete pairs block export. SHAK output contains a leading zero, first midpoint displacement from origin and interval metadata applied automatically on import. Older text files retain the current interval field.
 
-- **Visual Trajectory Node Canvas** - Plot, test, and dynamically scale custom multi-node movement patterns directly onto the coordinate grid system. ADDING SOON
-- **Focal-Length Speed Scaling** - Real-time evaluation coefficients calculate field-of-view (FOV) shifts, normalizing translation speeds instantly the millisecond you transition into aim down sights (ADS).
-- **Target Constraint Verification** - Standalone validation toggles enforce strict runtime barriers, preventing macro activation unless target input thresholds are actively verified (e.g., ignoring pull vectors during hip-fire actions).
+`profile_architect OLD.py` is a legacy reference, not the current tool.
 
-### Burst & Timing Module
+## Fullscreen overlay
 
-*   **High-Precision Timing** - Uses hardware-level reference counters (`time.perf_counter`) to hit exact timing cycles, ensuring perfect intervals (like an exact 60ms delay between burst-fire bullets) without skipping a beat.
-*   **Flexible Trigger Modes** - Swap between standard "hold-to-fire" mechanics or a "click-to-toggle" mode (click once to start firing, click again to stop).
+The **Overlay** tab is below Settings. Start/Stop/Restart and an enable checkbox control an isolated fullscreen renderer on the primary display.
 
-### Calibration & Variable Parameters
+- Borderless with black default background for display-fuser setups.
+- Background color/opacity independent of badge color/opacity.
+- Recoil, Burst and Distance badge visibility, colors, labels, size and placement.
+- Right-drag directly on fullscreen or use the scaled preview; fullscreen drag placements save automatically.
+- Optional TTF/OTF font, topmost and click-through settings.
+- Save writes `overlay.json`; running state is not saved.
+- Local F8/pedal and optional KMBox Mouse 4/5 toggle sources.
 
-1.  **In-Game Sensitivity** - Enter your exact hip-fire sensitivity so the script maps its pixel movements correctly.
-2.  **ADS Zoom Multiplier** - Define your zoom ratio. If your in-game ADS sensitivity is set to 75%, simply input `0.75`.
-3.  **Field of View (FOV)** - Match your in-game FOV to ensure the translation math remains perfectly accurate.
-4.  **Hardware Killswitch** - Map a mouse button (e.g., `Mouse 5`) to instantly kill or wake the device's hardware inputs.
-5.  **Panic Key** - Map a local keyboard hotkey (e.g., `/`, foot pedals, a controller paddle etc) as a background safety override to instantly pause the entire framework across the dual-PC setup.
+Windows transparency and fuser color-key behavior are different mechanisms. Physical fuser appearance needs hardware validation.
 
-### Far Recoil Scale
+## KMBox health and recovery
 
-The Recoil tab can switch between the profile's **Base** output and a configurable **Far mode** without changing its saved recoil nodes. Far X and Far Y multipliers are independent, range from `0.50` to `2.50`, and snap to `0.05` increments. Link X/Y when both axes should move together. Existing profiles fall back to `2.00 / 2.00`; saving a profile stores its Far settings. The toggle input can use KMBox Mouse 4/5, a control-PC key such as `num 1`, or a keyboard-emulating foot pedal. Do not reuse the firing or killswitch input.
+**READY / UNVERIFIED** means native initialization returned successfully, not proven delivery or current reachability. A worker heartbeat measures local activity only; no verified network heartbeat is enabled.
 
-KMNet uses UDP, and `kmNet.init()` does not verify that a physical box replied. A successful setup is therefore shown honestly as **READY / UNVERIFIED**, not connected. Native initialization, movement, and monitored-button failures are shown as **OFFLINE**; details appear in Settings.
+On detected movement/input exceptions:
 
-### Fullscreen Overlay
+1. Master pauses and runtime cancellation clears pending sequences/leftovers.
+2. Reconnect is attempted up to five times with 1/2/4/8-second backoff after failed attempts finish.
+3. Successful recovery leaves output paused.
+4. Press Master hotkey to reactivate, then release/repress held triggers.
 
-The Overlay tab starts an isolated, borderless fullscreen renderer for single-display fuser setups. Display Fuser mode defaults to a black background; Transparent mode uses a click-through color-keyed background. Recoil, Burst, and Distance badges can each be enabled, colored, resized, positioned, and previewed in the GUI. Right-drag a badge directly on the fullscreen overlay to move it; its position is synchronized and saved automatically. A custom `.ttf` or `.otf` font is optional. The saved hide/show input defaults to local `F8`, but KMBox Mouse 4/5 can also be selected. Save writes these settings to `overlay.json` without changing weapon profiles.
+Rearming is blocked while recovery is unresolved. After retries are exhausted, **Connect** starts a fresh cycle. Repeated offline ticks do not repeatedly publish the same Master pause notification.
 
-## Notes
-> [!IMPORTANT]
-> **Anybrain Detection Vectors:** Modern competitive titles are shifting toward server-side AI profiling systems like Anybrain. Unlike traditional kernel-level anti-cheats that scan local system memory for cheat signatures, Anybrain operates entirely on the server side via game telemetry APIs.
+Silent UDP loss may not raise an exception. Python cannot cancel a blocked native call; responsiveness can still be affected. Physical passthrough depends on box power/USB behavior, not this application's guarantees.
 
-### How Behavioral AI Works
+See [KMBox investigation](docs/kmbox-health.md) for SDK evidence and supervised validation steps. No HID action is sent as a heartbeat probe.
 
-* **Mouse Biometrics:** The AI processes raw mouse coordinates to analyze velocity, acceleration curves, and microscopic hand tremors. It looks for natural physiological fluctuations caused by human muscle fatigue or reaction lag.
-* **Keystroke Dynamics:** It monitors the exact millisecond hold-times of keys and the timing gaps between inputs to detect unnatural consistency. (mouse clicks not being random will ban u within 1-2 games. mouse move is fine)
-* **Pattern Profiling:** The platform establishes a baseline behavioral model for your account. If your mouse trajectories suddenly switch to mathematically rigid linear curves, the cloud engine flags the inputs as automated anomalies.
+## Profiles and compatibility
 
-### Impact on Hardware Emulation
+Settings save to JSON. Missing legacy fields receive the defaults shown in the GUI instead of inheriting previous-profile settings. Empty patterns are handled safely; malformed nodes and nonpositive divisor values are rejected. Rapid settings edits retain the latest values for the worker.
 
-Using a Dual-PC setup or a physical KMBox completely hides your local code signature, but it does not protect your gameplay from server-side behavioral profiling. If your script inputs are too perfect or lack humanized smoothing filters, Anybrain will flag the account based entirely on the mechanical output sent to the server.
+Back up personal profiles before sharing/manual editing. Simulation checks configuration, not gameplay calibration or hardware behavior.
 
----
+## Troubleshooting
 
-## Disclaimer and Liability
+| Symptom | Check |
+| --- | --- |
+| KMNet import fails | Windows x64 Python 3.11 and bundled `.pyd` |
+| READY but no output | Master/module state, trigger/ADS and actual device configuration; READY is unverified |
+| Recovered but no output | Master hotkey, then trigger release/repress |
+| Main-PC F8 does nothing | Local keys are read on control PC |
+| Extractor finds no image | Working directory and `recoil_processor/inputs` |
+| SHAK interval unknown | Measure it; projectile spacing is not a firing interval |
+| Makcu connection fails | Unfinished backend |
 
-> [!WARNING]
-> This software is strictly for educational, research, and personal testing purposes.
-> 
-> **By downloading, installing, or executing this software, you agree to the following terms:**
-> * **Use At Your Own Risk:** The authors and contributors assume absolutely no liability for any account bans, temporary suspensions, or hardware restrictions (such as HWID bans) issued by game developers or anti-cheat providers.
-> * **No Guarantees:** While this workspace utilizes hardware emulation and a Dual-PC setup to maximize isolation, no software or hardware automation layer is entirely undetectable. Anti-cheat heuristics change constantly. You are responsible for any outcomes.
-> * **Compliance:** You are entirely responsible for reading and understanding the Terms of Service (ToS) of any game you run alongside this tool. 
-> 
-> This project is provided "as is" without warranty of any kind, express or implied. In no event shall the copyright holders or contributors be liable for any claim, damages, or other liability arising from the use of this software.
+## Development
+
+See [implementation plan](implementation_plan.md). Planned phases: recovery-policy extraction, supervised heartbeat feasibility, backward-compatible game setups, shared extractor calibration, and saved/editable annotation projects. Planned features are not current support.
+
+Unit tests, GUI smoke checks and physical hardware validation are distinct. No guarantee of zero recoil, removed random spread, exact timing, uninterrupted networking or undetectability. Use only where permitted; you are responsible for game rules and account/hardware risks. Provided as-is without warranty.

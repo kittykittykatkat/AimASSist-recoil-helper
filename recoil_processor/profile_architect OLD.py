@@ -180,6 +180,14 @@ def render(img, clicks, view, weapon, interval_ms, status_msg=""):
     return frame
 
 
+def paired_midpoints(clicks):
+    """Return one center per simultaneous pair, without assuming fixed spread."""
+    if len(clicks) % 2:
+        raise ValueError("Complete the final impact pair before export")
+    return [((a[0] + b[0]) / 2, (a[1] + b[1]) / 2)
+            for a, b in zip(clicks[::2], clicks[1::2])]
+
+
 def run():
     parser = argparse.ArgumentParser(description="Manual recoil pattern builder")
     parser.add_argument("--weapon", default="M11", choices=list(WEAPON_RATES.keys()))
@@ -187,7 +195,10 @@ def run():
     parser.add_argument("--sens", type=float, default=22.0)
     parser.add_argument("--fov", type=int, default=100)
     parser.add_argument("--ads", action="store_true", help="ADS mode (applies zoom mult)")
+    parser.add_argument("--shak", action="store_true", help="Mark two simultaneous impacts per shot and export their midpoint")
     args = parser.parse_args()
+    if args.shak and (args.interval is None or args.interval <= 0):
+        parser.error("SHAK mode requires --interval in milliseconds between trigger pulls")
 
     interval_ms = args.interval or WEAPON_RATES.get(args.weapon, 60)
     fov_mod = 90.0 / args.fov
@@ -214,30 +225,57 @@ def run():
 
     view = ZoomView(img_w, img_h)
     clicks = []  # (img_x, img_y) in original image coordinates
+    origin = None
     status = ""
+
+    def draw(status_msg=""):
+        if not args.shak:
+            return render(img, clicks, view, args.weapon, interval_ms, status_msg)
+        centers = paired_midpoints(clicks[:len(clicks) // 2 * 2])
+        frame = render(img, centers, view, "SHAK", interval_ms,
+                       "Click starting aim point" if origin is None else
+                       f"Pair {len(clicks)//2 + 1}: impact {len(clicks)%2 + 1}/2")
+        if origin is not None:
+            point = view.img_to_screen(*origin)
+            cv2.drawMarker(frame, point, (255, 0, 255), cv2.MARKER_CROSS, 16, 2)
+            cv2.putText(frame, "ORIGIN", point, cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
+        for i in range(0, len(clicks), 2):
+            first = view.img_to_screen(*clicks[i])
+            cv2.circle(frame, first, 4, (255, 180, 0), 1)
+            if i + 1 < len(clicks):
+                second = view.img_to_screen(*clicks[i + 1])
+                cv2.circle(frame, second, 4, (255, 180, 0), 1)
+                cv2.line(frame, first, second, (255, 180, 0), 1)
+                width = abs(clicks[i + 1][0] - clicks[i][0])
+                cv2.putText(frame, f"{i//2+1}: {width:.1f}px", first,
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 180, 0), 1)
+        return frame
 
     win = f"Profile Architect [{args.weapon}] - click holes in order"
     cv2.namedWindow(win, cv2.WINDOW_AUTOSIZE)
 
     # Mouse callback
     def on_mouse(event, x, y, flags, param):
-        nonlocal status
+        nonlocal status, origin
         if event == cv2.EVENT_LBUTTONDOWN and y < VIEW_H:
             img_x, img_y = view.screen_to_img(x, y)
             img_x = max(0, min(img_w - 1, img_x))
             img_y = max(0, min(img_h - 1, img_y))
-            clicks.append((img_x, img_y))
+            if args.shak and origin is None:
+                origin = (img_x, img_y)
+            else:
+                clicks.append((img_x, img_y))
             status = f"#{len(clicks)} placed"
-            cv2.imshow(win, render(img, clicks, view, args.weapon, interval_ms, status))
+            cv2.imshow(win, draw(status))
         elif event == cv2.EVENT_MOUSEWHEEL:
             if flags > 0:
                 view.zoom_at(x, y, zoom_in=True)
             else:
                 view.zoom_at(x, y, zoom_in=False)
-            cv2.imshow(win, render(img, clicks, view, args.weapon, interval_ms))
+            cv2.imshow(win, draw())
 
     cv2.setMouseCallback(win, on_mouse)
-    cv2.imshow(win, render(img, clicks, view, args.weapon, interval_ms))
+    cv2.imshow(win, draw())
 
     PAN_SPEED = 40
 
@@ -245,13 +283,19 @@ def run():
         key = cv2.waitKey(30) & 0xFF
 
         if key == ord('q') or key == 13:  # Q / Enter
+            if args.shak and len(clicks) % 2:
+                print("[!] Complete the final pair or press Z to undo its first impact")
+                continue
             break
         elif key == ord('c'):
             clicks.clear()
+            origin = None
             status = "Cleared"
         elif key == ord('z') and clicks:
             clicks.pop()
             status = f"Undo → {len(clicks)}"
+        elif key == ord('z') and args.shak:
+            origin = None
         elif key == ord('f'):
             view.fit()
             status = "Fit"
@@ -272,20 +316,28 @@ def run():
         else:
             continue
 
-        cv2.imshow(win, render(img, clicks, view, args.weapon, interval_ms, status))
+        cv2.imshow(win, draw(status))
         status = ""
 
     cv2.destroyAllWindows()
+
+    if args.shak:
+        if origin is None or not clicks:
+            print("[!] Mark an origin and at least one complete pair")
+            return
+        clicks = [origin] + paired_midpoints(clicks)
 
     if len(clicks) < 2:
         print("[!] Need at least 2 clicks")
         return
 
     # ── Export ──
-    out_name = os.path.splitext(name)[0] + f"_{args.weapon}_profile.txt"
+    out_name = os.path.splitext(name)[0] + f"_{'SHAK' if args.shak else args.weapon}_profile.txt"
     out_path = os.path.join(OUTPUT_DIR, out_name)
 
     with open(out_path, "w") as f:
+        if args.shak:
+            f.write(f"# interval_ms={interval_ms}\n")
         f.write("0.00, 0.00\n")
         for i in range(1, len(clicks)):
             dx_px = clicks[i][0] - clicks[i-1][0]

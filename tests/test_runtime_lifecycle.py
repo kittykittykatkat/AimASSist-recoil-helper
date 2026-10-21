@@ -16,6 +16,126 @@ sys.modules.setdefault("dearpygui", dearpygui_package)
 sys.modules.setdefault("dearpygui.dearpygui", dearpygui_stub)
 
 import master_control
+import pytest
+
+
+def test_linear_mod_links_stay_synchronized(monkeypatch):
+    values = {}
+    monkeypatch.setattr(master_control.dpg, "set_value", values.__setitem__, raising=False)
+    monkeypatch.setattr(master_control, "PENDING_SETTINGS", {})
+    master_control.callback_linear_enabled(None, True)
+    assert values["ui_linear_enabled"] is True
+    assert values["ui_toggle_linear_mod"] is True
+    assert values["ui_toggle_recoil_mod"] is False
+    master_control.callback_linear_enabled(None, False)
+    assert values["ui_linear_enabled"] is False
+    assert values["ui_toggle_linear_mod"] is False
+
+
+@pytest.fixture(autouse=True)
+def isolate_device_recovery(monkeypatch):
+    monkeypatch.setattr(master_control, "DEVICE_RECOVERY_BLOCKED", threading.Event())
+    monkeypatch.setattr(master_control, "_device_retry_config", None)
+    monkeypatch.setattr(master_control, "DEFAULT_STATE", master_control.DEFAULT_STATE.copy())
+
+
+def test_fault_requires_recovery_then_explicit_hotkey(monkeypatch):
+    master_control.DEFAULT_STATE["master_active"] = True
+    master_control.pause_for_device_fault()
+    assert not master_control.DEFAULT_STATE["master_active"]
+    assert not master_control.toggle_master_output()
+    master_control.DEVICE_RECOVERY_BLOCKED.clear()
+    assert not master_control.DEFAULT_STATE["master_active"]
+    assert master_control.toggle_master_output()
+
+
+def test_reconnect_is_bounded_and_does_not_rearm(monkeypatch):
+    device = master_control.KMBoxDevice()
+    monkeypatch.setattr(master_control, "DEVICE", device)
+    monkeypatch.setattr(master_control, "DEVICE_REQUESTS", queue.Queue(maxsize=1))
+    monkeypatch.setattr(master_control, "DEVICE_HEALTH", {"attempts": 0})
+    monkeypatch.setattr(master_control, "_device_retry_config", {"device_type": "KMBox"})
+    monkeypatch.setattr(master_control, "_device_retry_at", 0)
+    calls = []
+    monkeypatch.setattr(master_control, "connect_device_from_config", lambda cfg: calls.append(cfg) or False)
+    for now in range(0, 100, 10):
+        monkeypatch.setattr(master_control.time, "monotonic", lambda: now)
+        master_control.service_device_connection(now)
+    assert len(calls) == 5
+    assert master_control.DEVICE_RECOVERY_BLOCKED.is_set()
+    assert not master_control.DEFAULT_STATE["master_active"]
+
+
+def test_repeated_fault_pause_does_not_flood_ui():
+    drain_ui_updates()
+    master_control.pause_for_device_fault()
+    master_control.pause_for_device_fault()
+    assert master_control.UI_UPDATE_QUEUE.get_nowait() == ("status", False)
+    assert master_control.UI_UPDATE_QUEUE.empty()
+
+
+def test_retry_delay_starts_after_initialization_finishes(monkeypatch):
+    monkeypatch.setattr(master_control, "DEVICE", master_control.KMBoxDevice())
+    monkeypatch.setattr(master_control, "DEVICE_REQUESTS", queue.Queue(maxsize=1))
+    monkeypatch.setattr(master_control, "DEVICE_HEALTH", {"attempts": 0})
+    monkeypatch.setattr(master_control, "_device_retry_config", {"device_type": "KMBox"})
+    monkeypatch.setattr(master_control, "_device_retry_at", 0)
+    monkeypatch.setattr(master_control.time, "monotonic", lambda: 15.0)
+    monkeypatch.setattr(master_control, "connect_device_from_config", lambda cfg: False)
+    master_control.service_device_connection(10.0)
+    assert master_control._device_retry_at == 16.0
+
+
+def test_import_preserves_shak_interval_and_legacy_fallback(tmp_path, monkeypatch):
+    values = {"ui_time_interval": 0.15}
+    monkeypatch.setattr(master_control.dpg, "get_value", values.get, raising=False)
+    monkeypatch.setattr(master_control.dpg, "set_value", values.__setitem__, raising=False)
+    monkeypatch.setattr(master_control, "redraw_recoil_canvas", lambda: None)
+    monkeypatch.setattr(master_control, "_update_node_info", lambda: None)
+    monkeypatch.setattr(master_control, "DEFAULT_STATE", {})
+    monkeypatch.setattr(master_control, "PENDING_SETTINGS", {})
+    path = tmp_path / "shak.txt"
+    path.write_text("# interval_ms=250\n0, 0\n1, 2\n")
+    master_control.callback_import_file_ok(None, {"selections": {"shak": str(path)}})
+    assert values["ui_time_interval"] == 0.25
+    assert master_control.DEFAULT_STATE["recoil_nodes"][1] == [0.25, 1, 2]
+    path.write_text("0, 0\n3, 4\n")
+    values["ui_time_interval"] = 0.1
+    master_control.callback_import_file_ok(None, {"selections": {"shak": str(path)}})
+    assert master_control.DEFAULT_STATE["recoil_nodes"][1] == [0.1, 3, 4]
+
+
+def test_legacy_profile_uses_complete_defaults():
+    profile = master_control.normalize_profile({"recoil_scale_x": 1.25})
+    assert profile["recoil_scale_x"] == 1.25
+    assert profile["local_sens"] == 22.0
+    assert profile["local_zoom_mult"] == 0.75
+    assert profile["far_scale_x"] == 2.0
+    assert "master_active" not in profile
+
+
+def test_profile_rejects_invalid_nodes_and_zero_divisors():
+    import pytest
+    for value in ({"recoil_nodes": [[0, 1]]}, {"local_sens": 0},
+                  {"burst_intra_delay_ms": 0}):
+        with pytest.raises(ValueError):
+            master_control.normalize_profile(value)
+    assert master_control.normalize_profile({"recoil_nodes": []})["recoil_nodes"] == [[0, 0, 0]]
+
+
+def test_settings_coalesce_final_slider_value(monkeypatch):
+    monkeypatch.setattr(master_control, "PENDING_SETTINGS", {})
+    for value in range(100):
+        master_control.queue_runtime_settings({"recoil_scale_x": value})
+    master_control.queue_runtime_settings({"recoil_scale_y": 1.5})
+    assert master_control.PENDING_SETTINGS == {"recoil_scale_x": 99, "recoil_scale_y": 1.5}
+
+
+def test_empty_canvas_layout_is_safe(monkeypatch):
+    monkeypatch.setattr(master_control, "DEFAULT_STATE", {"recoil_nodes": []})
+    points, scale, origin = master_control._compute_canvas_layout()
+    assert points == []
+    assert scale == 1.0
 
 
 class RecordingDevice(master_control.HWDevice):
@@ -299,6 +419,7 @@ def test_kmbox_move_failure_posts_offline_status(monkeypatch):
     device.move(1, 2)
 
     assert not device.is_connected()
+    assert master_control.UI_UPDATE_QUEUE.get_nowait() == ("status", False)
     assert master_control.UI_UPDATE_QUEUE.get_nowait() == (
         "device_status",
         False,
@@ -319,6 +440,7 @@ def test_kmbox_input_failure_posts_offline_status(monkeypatch):
 
     assert not device.is_down("Mouse 5")
     assert not device.is_connected()
+    assert master_control.UI_UPDATE_QUEUE.get_nowait() == ("status", False)
     assert master_control.UI_UPDATE_QUEUE.get_nowait() == (
         "device_status",
         False,

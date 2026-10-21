@@ -1,6 +1,7 @@
-import os, sys, time, json, glob, random, queue, threading, logging, ctypes, multiprocessing
+import os, sys, time, json, glob, random, queue, threading, logging, ctypes, multiprocessing, copy, math
 import keyboard
 import dearpygui.dearpygui as dpg
+from linear_motion import LinearMotion, DEFAULTS as LINEAR_DEFAULTS, BEHAVIORS as LINEAR_BEHAVIORS
 from overlay_config import load_overlay_config, save_overlay_config, validate_overlay_config
 from overlay_renderer import run_overlay
 
@@ -79,7 +80,10 @@ class KMBoxDevice(HWDevice):
         if not self._ok:
             return
         self._ok = False
+        pause_for_device_fault()
         message = f"KMBox {operation} failed: {exc}"
+        DEVICE_HEALTH["last_error"] = message
+        DEVICE_HEALTH["attempts"] = 0
         logging.error(message)
         post_device_status(False, message)
     def move(self, x, y):
@@ -174,6 +178,67 @@ class SimDevice(HWDevice):
 
 # Global device instance — swapped out by connect_device_from_config()
 DEVICE: HWDevice = SimDevice()
+DEVICE_REQUESTS = queue.Queue(maxsize=1)
+DEVICE_RECOVERY_BLOCKED = threading.Event()
+DEVICE_HEALTH = {"worker_tick": 0.0, "attempts": 0, "last_init": 0.0, "last_error": ""}
+_device_retry_config = None
+_device_retry_at = 0.0
+
+def pause_for_device_fault():
+    """Latch output off until recovery and an explicit Master hotkey press."""
+    with STATE_LOCK:
+        notify = not DEVICE_RECOVERY_BLOCKED.is_set() or DEFAULT_STATE["master_active"]
+        DEVICE_RECOVERY_BLOCKED.set()
+        DEFAULT_STATE["master_active"] = False
+    if not notify:
+        return
+    try:
+        UI_UPDATE_QUEUE.put_nowait(("status", False))
+    except queue.Full:
+        logging.warning("Master pause notification queue full; output remains paused")
+
+def toggle_master_output():
+    """Refuse rearming while a known device fault is unresolved."""
+    with STATE_LOCK:
+        if DEVICE_RECOVERY_BLOCKED.is_set():
+            DEFAULT_STATE["master_active"] = False
+        else:
+            DEFAULT_STATE["master_active"] = not DEFAULT_STATE["master_active"]
+        return DEFAULT_STATE["master_active"]
+
+def service_device_connection(now):
+    """Perform requested initialization and bounded retries on the hardware owner."""
+    global _device_retry_config, _device_retry_at
+    DEVICE_HEALTH["worker_tick"] = now
+    requested = None
+    try:
+        requested = DEVICE_REQUESTS.get_nowait()
+    except queue.Empty:
+        pass
+    if requested is not None:
+        _device_retry_config = requested
+        DEVICE_HEALTH["attempts"] = 0
+        _device_retry_at = now
+        pause_for_device_fault()
+    if isinstance(DEVICE, KMBoxDevice) and not DEVICE.is_connected() and _device_retry_config:
+        pause_for_device_fault()
+    elif requested is None:
+        return
+    if now < _device_retry_at or DEVICE_HEALTH["attempts"] >= 5:
+        return
+    DEVICE_HEALTH["attempts"] += 1
+    post_device_status(False, f"Initializing / reconnecting (attempt {DEVICE_HEALTH['attempts']}/5)")
+    success = connect_device_from_config(_device_retry_config)
+    if success:
+        DEVICE_HEALTH["last_init"] = time.monotonic()
+        DEVICE_HEALTH["last_error"] = ""
+        DEVICE_RECOVERY_BLOCKED.clear()
+        post_device_status(True, "Ready; output remains paused. Press Master hotkey to reactivate.")
+    else:
+        DEVICE_HEALTH["last_error"] = "Initialization failed"
+        _device_retry_at = time.monotonic() + min(8.0, 2 ** (DEVICE_HEALTH["attempts"] - 1))
+        if DEVICE_HEALTH["attempts"] >= 5:
+            post_device_status(False, "Reconnect attempts exhausted. Use Connect to retry; output remains paused.")
 
 # ---------------------------------------------------------------------------
 # DEVICE CONFIG  (device.json — separate from weapon profiles)
@@ -205,7 +270,8 @@ def save_device_config(cfg: dict):
         logging.error(f"device.json save failed: {e}")
 
 def connect_device_from_config(cfg: dict) -> bool:
-    global DEVICE
+    global DEVICE, _device_retry_config
+    _device_retry_config = cfg.copy()
     previous_device = DEVICE
     dtype = cfg.get("device_type", "KMBox")
     if dtype == "KMBox":
@@ -316,7 +382,54 @@ DEFAULT_STATE = {
     "hw_killswitch_key":     "Mouse 5",
 }
 
+DEFAULT_STATE.update(LINEAR_DEFAULTS)
 OVERLAY_CONFIG = load_overlay_config()
+PROFILE_DEFAULTS = copy.deepcopy(DEFAULT_STATE)
+PROFILE_DEFAULTS.update(local_sens=22.0, local_zoom_mult=0.75)
+PENDING_SETTINGS = {}
+SETTINGS_LOCK = threading.Lock()
+
+def queue_runtime_settings(values: dict) -> None:
+    """Coalesce GUI settings so rapid edits cannot lose their final values."""
+    with SETTINGS_LOCK:
+        PENDING_SETTINGS.update(copy.deepcopy(values))
+
+def normalize_profile(value: dict) -> dict:
+    """Complete legacy profiles before changing either GUI or runtime state."""
+    if not isinstance(value, dict):
+        raise ValueError("Profile must contain a JSON object")
+    result = copy.deepcopy(PROFILE_DEFAULTS)
+    result.update({key: value[key] for key in PROFILE_DEFAULTS if key in value
+                   and key not in ("master_active", "active_tab")})
+    if result["recoil_motion_mode"] not in ("Pattern", "Linear"):
+        raise ValueError("Unknown recoil movement mode")
+    if result["linear_behavior"] not in LINEAR_BEHAVIORS:
+        raise ValueError("Unknown linear behavior")
+    for key in LINEAR_DEFAULTS:
+        if key in ("recoil_motion_mode", "linear_behavior"):
+            continue
+        number = result[key]
+        if not isinstance(number, (int, float)) or not math.isfinite(number):
+            raise ValueError(f"{key} must be finite")
+        if key.endswith("_ms") and number < 0:
+            raise ValueError(f"{key} cannot be negative")
+    nodes = result["recoil_nodes"]
+    if not isinstance(nodes, list):
+        raise ValueError("Recoil nodes must be a list")
+    for node in nodes:
+        if (not isinstance(node, (list, tuple)) or len(node) != 3
+                or any(not isinstance(n, (int, float)) or not math.isfinite(n) for n in node)):
+            raise ValueError("Each recoil node must contain three finite numbers")
+    result["recoil_nodes"] = nodes or [[0.0, 0.0, 0.0]]
+    for key in ("local_sens", "local_zoom_mult", "local_fov", "time_step_interval",
+                "burst_intra_delay_ms", "burst_inter_delay_ms", "burst_count"):
+        number = result[key]
+        if not isinstance(number, (int, float)) or not math.isfinite(number) or number <= 0:
+            raise ValueError(f"{key} must be a positive finite number")
+    result.pop("master_active")
+    result.pop("active_tab")
+    result["distance_scale_2x_active"] = False
+    return result
 OVERLAY_PROCESS = None
 OVERLAY_COMMAND_QUEUE = None
 OVERLAY_STATUS_QUEUE = None
@@ -378,9 +491,7 @@ def main_pc_keyboard_listener_worker(stop_event=None):
             if keyboard.is_pressed(target):
                 if not latch:
                     latch = True
-                    with STATE_LOCK:
-                        DEFAULT_STATE["master_active"] = not DEFAULT_STATE["master_active"]
-                        active = DEFAULT_STATE["master_active"]
+                    active = toggle_master_output()
                     try: UI_UPDATE_QUEUE.put_nowait(("status", active))
                     except queue.Full: pass
                     logging.info(f"PC panic: {'ONLINE' if active else 'PAUSED'}")
@@ -470,7 +581,7 @@ def callback_save_config(sender, app_data):
     if not filename: return
     if not filename.endswith(".json"): filename += ".json"
     blob = {
-        "recoil_module_enabled":  dpg.get_value("ui_toggle_recoil_mod"),
+        "recoil_module_enabled":  dpg.get_value("ui_toggle_recoil_mod") or dpg.get_value("ui_linear_enabled"),
         "burst_module_enabled":   dpg.get_value("ui_toggle_burst_mod"),
         "recoil_trigger_key":     dpg.get_value("ui_recoil_trigger_combo"),
         "burst_trigger_key":      dpg.get_value("ui_burst_trigger_combo"),
@@ -504,6 +615,7 @@ def callback_save_config(sender, app_data):
         "hw_killswitch_enabled":  dpg.get_value("ui_hw_ks_enabled"),
         "hw_killswitch_key":      dpg.get_value("ui_hw_ks_key_combo"),
     }
+    blob.update({key: dpg.get_value("ui_" + key) for key in LINEAR_DEFAULTS})
     with open(os.path.join(CONFIG_DIR, filename), "w") as f:
         json.dump(blob, f, indent=4)
     logging.info(f"Saved: {filename}")
@@ -514,8 +626,15 @@ def callback_load_config(sender, app_data):
     if filename in ["No configs found", "Select Profile", None]: return
     try:
         with open(os.path.join(CONFIG_DIR, filename)) as f:
-            data = json.load(f)
+            data = normalize_profile(json.load(f))
+        for key in LINEAR_DEFAULTS:
+            dpg.set_value("ui_" + key, data[key])
+        refresh_linear_controls()
         dpg.set_value("ui_toggle_recoil_mod",   data.get("recoil_module_enabled", True))
+        dpg.set_value("ui_linear_enabled", data["recoil_motion_mode"] == "Linear" and data["recoil_module_enabled"])
+        dpg.set_value("ui_toggle_linear_mod", dpg.get_value("ui_linear_enabled"))
+        if data["recoil_motion_mode"] == "Linear":
+            dpg.set_value("ui_toggle_recoil_mod", False)
         dpg.set_value("ui_toggle_burst_mod",     data.get("burst_module_enabled",  True))
         dpg.set_value("ui_recoil_trigger_combo", data.get("recoil_trigger_key", "Mouse 5"))
         dpg.set_value("ui_burst_trigger_combo",  data.get("burst_trigger_key",  "Mouse 4"))
@@ -553,9 +672,7 @@ def callback_load_config(sender, app_data):
         dpg.set_value("ui_hw_ks_key_combo",      data.get("hw_killswitch_key",  "Mouse 5"))
         DEFAULT_STATE["recoil_nodes"] = data.get("recoil_nodes", [[0.0, 0.0, 0.0]])
         data["distance_scale_2x_active"] = False
-        # Push full blob — maxsize=16 means this won't stomp a simultaneous change
-        try: DATA_QUEUE.put_nowait(data)
-        except queue.Full: pass
+        queue_runtime_settings(data)
         with STATE_LOCK:
             DEFAULT_STATE["recoil_module_enabled"] = data.get("recoil_module_enabled", True)
             DEFAULT_STATE["burst_module_enabled"]  = data.get("burst_module_enabled", True)
@@ -588,6 +705,12 @@ def precision_sleep(duration):
 # ---------------------------------------------------------------------------
 def hardware_consumer_engine(data_mailbox, stop_event=None):
     rs = DEFAULT_STATE.copy()
+    linear_motion = LinearMotion()
+    linear_accum_x = linear_accum_y = 0.0
+    previous_engine = rs["recoil_motion_mode"]
+    engine_needs_release = False
+    was_active = False
+    burst_needs_release = False
 
     recoil_trigger_latch = False
     start_burst_time     = 0.0
@@ -623,10 +746,14 @@ def hardware_consumer_engine(data_mailbox, stop_event=None):
 
     while not stop_event or not stop_event.is_set():
         try:
+            service_device_connection(time.monotonic())
             # Drain config updates (maxsize=16 — no silent drops on rapid changes)
             while True:
                 try: rs.update(data_mailbox.get_nowait())
                 except queue.Empty: break
+            with SETTINGS_LOCK:
+                rs.update(PENDING_SETTINGS)
+                PENDING_SETTINGS.clear()
 
             with STATE_LOCK:
                 is_active = DEFAULT_STATE["master_active"]
@@ -636,9 +763,11 @@ def hardware_consumer_engine(data_mailbox, stop_event=None):
                     raw_nodes = DEFAULT_STATE["recoil_nodes"]
 
             # Pre-sorted nodes cache — re-sort only when list object changes
-            if is_active and raw_nodes is not _nodes_list_ref:
-                _nodes_sorted   = sorted(raw_nodes, key=lambda n: n[0])
-                _nodes_list_ref = raw_nodes
+            if is_active:
+                node_snapshot = tuple(tuple(node) for node in raw_nodes)
+                if node_snapshot != _nodes_list_ref:
+                    _nodes_sorted = sorted(node_snapshot, key=lambda n: n[0])
+                    _nodes_list_ref = node_snapshot
 
             # -- PER-TAB MODULE KILLSWITCHES (run even when paused) --
             r_ks = rs["recoil_ks_key"]
@@ -651,7 +780,10 @@ def hardware_consumer_engine(data_mailbox, stop_event=None):
                     if not new:
                         recoil_trigger_latch = False
                         recoil_toggled_on    = False
-                    ui_post("ui_toggle_recoil_mod", new)
+                    linear_selected = rs["recoil_motion_mode"] == "Linear"
+                    ui_post("ui_toggle_recoil_mod", new and not linear_selected)
+                    ui_post("ui_linear_enabled", new and linear_selected)
+                    ui_post("ui_toggle_linear_mod", new and linear_selected)
                     logging.info(f"Recoil: {'ON' if new else 'OFF'}")
                 r_ks_prev = r_ks_c
             else:
@@ -677,9 +809,7 @@ def hardware_consumer_engine(data_mailbox, stop_event=None):
             if hw_ks_on:
                 hw_c = key(hw_ks_key)
                 if hw_c and not hw_ks_prev:
-                    with STATE_LOCK:
-                        DEFAULT_STATE["master_active"] = not DEFAULT_STATE["master_active"]
-                        is_active = DEFAULT_STATE["master_active"]
+                    is_active = toggle_master_output()
                     try: UI_UPDATE_QUEUE.put_nowait(("status", is_active))
                     except queue.Full: pass
                 hw_ks_prev = hw_c
@@ -697,12 +827,24 @@ def hardware_consumer_engine(data_mailbox, stop_event=None):
                 overlay_toggle_prev = False
 
             if not is_active:
+                was_active = False
+                engine_needs_release = True
+                burst_needs_release = True
+                accum_x = accum_y = 0.0
+                linear_motion.reset()
+                linear_accum_x = linear_accum_y = 0.0
                 in_burst_sequence    = False
                 recoil_trigger_latch = False
                 recoil_toggled_on    = False
                 burst_toggled_on     = False
+                prev_b_phys = key(rs["burst_trigger_key"])
                 time.sleep(0.01)
                 continue
+
+            if not was_active:
+                engine_needs_release = True
+                burst_needs_release = True
+                was_active = True
 
             if rs["distance_scale_enabled"]:
                 scale_pressed = is_distance_scale_pressed(
@@ -730,6 +872,17 @@ def hardware_consumer_engine(data_mailbox, stop_event=None):
             ads     = key("right click")
 
             r_phys = key(rs["recoil_trigger_key"])
+            if rs["recoil_motion_mode"] != previous_engine:
+                previous_engine = rs["recoil_motion_mode"]
+                engine_needs_release = r_phys
+                recoil_toggled_on = False
+                recoil_trigger_latch = False
+                accum_x = accum_y = linear_accum_x = linear_accum_y = 0.0
+                linear_motion.reset()
+            if engine_needs_release:
+                engine_needs_release = r_phys
+                prev_r_phys = r_phys
+                r_phys = False
             if rs["recoil_is_toggle"]:
                 if r_phys and not prev_r_phys: recoil_toggled_on = not recoil_toggled_on
                 raw_r = recoil_toggled_on
@@ -738,6 +891,10 @@ def hardware_consumer_engine(data_mailbox, stop_event=None):
             prev_r_phys = r_phys
 
             b_phys = key(rs["burst_trigger_key"])
+            if burst_needs_release:
+                burst_needs_release = b_phys
+                prev_b_phys = b_phys
+                b_phys = False
             if rs["burst_is_toggle"]:
                 if b_phys and not prev_b_phys: burst_toggled_on = not burst_toggled_on
                 raw_b = burst_toggled_on
@@ -748,6 +905,13 @@ def hardware_consumer_engine(data_mailbox, stop_event=None):
             active_mode, is_firing = select_runtime_mode(
                 rs, raw_r, raw_b, ads, in_burst_sequence
             )
+            with STATE_LOCK:
+                if not DEFAULT_STATE["master_active"]:
+                    continue
+            linear_active = active_mode == "Recoil" and rs["recoil_motion_mode"] == "Linear"
+            linear_dx, linear_dy = linear_motion.step(now, linear_active, rs)
+            if not linear_active:
+                linear_accum_x = linear_accum_y = 0.0
 
             if in_burst_sequence and rs["burst_require_ads"] and not ads:
                 in_burst_sequence = False; last_burst_finish = now
@@ -759,6 +923,20 @@ def hardware_consumer_engine(data_mailbox, stop_event=None):
                 sens_mod = 22.0 / (rs["local_sens"] * zm)
 
                 if active_mode == "Recoil":
+                    if rs["recoil_motion_mode"] == "Linear":
+                        recoil_trigger_latch = False
+                        accum_x = accum_y = 0.0
+                        far_x, far_y = get_far_scale_multipliers(
+                            rs["distance_scale_2x_active"], rs["far_scale_x"], rs["far_scale_y"])
+                        linear_accum_x += linear_dx * rs["recoil_scale_x"] * far_x * fov_mod * sens_mod
+                        linear_accum_y += linear_dy * rs["recoil_scale_y"] * far_y * fov_mod * sens_mod
+                        mx, my = int(linear_accum_x), int(linear_accum_y)
+                        if mx or my:
+                            DEVICE.move(mx, my)
+                        linear_accum_x -= mx
+                        linear_accum_y -= my
+                        precision_sleep(0.001)
+                        continue
                     if not recoil_trigger_latch:
                         recoil_trigger_latch = True
                         start_burst_time     = now
@@ -816,7 +994,7 @@ _user_zoom = 1.0   # multiplier on top of auto-fit
 def _compute_canvas_layout():
     """Auto-zoom: compute screen positions for all nodes to fit the canvas."""
     nodes = DEFAULT_STATE["recoil_nodes"]
-    empty = len(nodes) <= 1 and nodes[0][1] == 0.0 and nodes[0][2] == 0.0
+    empty = not nodes or (len(nodes) == 1 and nodes[0][1] == 0.0 and nodes[0][2] == 0.0)
     fallback_origin = (CANVAS_W // 2, CANVAS_PAD + 10)
     if not nodes or empty:
         _canvas_cache.update(pts=[], scale=1.0, origin=fallback_origin)
@@ -874,7 +1052,7 @@ def _update_node_info():
     count = len(nodes)
     if not dpg.does_item_exist("ui_node_count_text"):
         return
-    if count <= 1 and nodes[0][1] == 0.0 and nodes[0][2] == 0.0:
+    if not nodes or (count == 1 and nodes[0][1] == 0.0 and nodes[0][2] == 0.0):
         dpg.set_value("ui_node_count_text", "Empty \u2014 click canvas or import a .txt")
         return
     iv = dpg.get_value("ui_time_interval") or 0.1
@@ -1141,9 +1319,17 @@ def callback_import_file_ok(sender, app_data):
     filepath = list(selections.values())[0]
     try:
         raw_nodes = []
+        imported_interval = None
         with open(filepath) as f:
             for line in f:
                 line = line.strip()
+                if line.startswith("# interval_ms="):
+                    imported_interval = float(line.split("=", 1)[1]) / 1000.0
+                    if not math.isfinite(imported_interval) or imported_interval <= 0:
+                        raise ValueError("Imported interval must be positive and finite")
+                    continue
+                if line.startswith("#"):
+                    continue
                 if not line:
                     continue
                 cleaned = line.replace('. ', ', ')
@@ -1154,7 +1340,10 @@ def callback_import_file_ok(sender, app_data):
         if not raw_nodes:
             logging.warning("Import: no valid nodes found")
             return
-        iv = dpg.get_value("ui_time_interval")
+        iv = imported_interval if imported_interval is not None else dpg.get_value("ui_time_interval")
+        if imported_interval is not None:
+            dpg.set_value("ui_time_interval", iv)
+            queue_runtime_settings({"time_step_interval": iv})
         recoil_nodes = [[round(i * iv, 4), x, y] for i, (x, y) in enumerate(raw_nodes)]
         DEFAULT_STATE["recoil_nodes"] = recoil_nodes
         redraw_recoil_canvas()
@@ -1189,9 +1378,39 @@ def redraw_burst_canvas():
         dpg.draw_circle(pts[-1], 4, color=(147, 51, 234, 255), fill=(147, 51, 234, 255), parent="burst_canvas")
 
 
+def refresh_linear_controls():
+    """Expose only the timing controls used by the selected movement behavior."""
+    linear = dpg.get_value("ui_recoil_motion_mode") == "Linear"
+    behavior = dpg.get_value("ui_linear_behavior")
+    dpg.configure_item("linear_controls", show=True)
+    dpg.configure_item("ui_linear_duration_ms", show=behavior == "Smooth correction")
+    dpg.configure_item("ui_linear_interval_ms", show=behavior == "Repeat while held")
+    units = "counts/second" if behavior == "Continuous pull" else "counts/correction"
+    dpg.set_value("linear_summary", f"{behavior} | {units} | X: left (-) / right (+), Y: up (-) / down (+)")
+
+def callback_linear_setting(sender, app_data, user_data):
+    ui_thread_push_sync(sender, app_data, user_data)
+    refresh_linear_controls()
+
+def callback_linear_enabled(sender, app_data):
+    dpg.set_value("ui_linear_enabled", app_data)
+    dpg.set_value("ui_toggle_linear_mod", app_data)
+    dpg.set_value("ui_recoil_motion_mode", "Linear")
+    dpg.set_value("ui_toggle_recoil_mod", False)
+    queue_runtime_settings({"recoil_motion_mode": "Linear", "recoil_module_enabled": app_data})
+    with STATE_LOCK:
+        DEFAULT_STATE["recoil_module_enabled"] = app_data
+
+def callback_pattern_enabled(sender, app_data, user_data):
+    if app_data:
+        dpg.set_value("ui_recoil_motion_mode", "Pattern")
+        dpg.set_value("ui_linear_enabled", False)
+        dpg.set_value("ui_toggle_linear_mod", False)
+        queue_runtime_settings({"recoil_motion_mode": "Pattern"})
+    ui_thread_push_sync(sender, app_data, user_data)
+
 def ui_thread_push_sync(sender, app_data, user_data):
-    try: DATA_QUEUE.put_nowait({user_data: app_data})
-    except queue.Full: pass
+    queue_runtime_settings({user_data: app_data})
     if user_data in ["recoil_module_enabled", "burst_module_enabled"]:
         with STATE_LOCK:
             DEFAULT_STATE[user_data] = app_data
@@ -1585,9 +1804,13 @@ def callback_device_connect(sender, app_data):
         "makcu_baud":    dpg.get_value("ui_makcu_baud"),
     }
     try:
-        success = connect_device_from_config(cfg)
+        try:
+            DEVICE_REQUESTS.get_nowait()
+        except queue.Empty:
+            pass
+        DEVICE_REQUESTS.put_nowait(cfg)
         save_device_config(cfg)
-        _update_device_status_ui(success)
+        _update_device_status_ui(False, "Connection requested; output will pause during initialization")
     finally:
         DEVICE_CONNECT_LOCK.release()
         if dpg.does_item_exist("ui_device_connect"):
@@ -1616,7 +1839,7 @@ def _update_device_status_ui(connected: bool, message=None):
     )
     dpg.configure_item("ui_device_sidebar", color=sidebar_color)
     if dpg.does_item_exist("ui_device_error"):
-        dpg.set_value("ui_device_error", "" if connected else (message or "Device unavailable"))
+        dpg.set_value("ui_device_error", message or ("" if connected else "Device unavailable"))
 
 def _update_distance_scale_ui(scale_2x_active):
     """Keep distance status synchronized with runtime and manual changes."""
@@ -1685,6 +1908,7 @@ def callback_hw_ks_key(sender, app_data):
 # ---------------------------------------------------------------------------
 _TAB_INFO = {
     "panel_recoil":   ("btn_tab_recoil",   "Recoil Workspace"),
+    "panel_linear":   ("btn_tab_linear",   "Linear Workspace"),
     "panel_burst":    ("btn_tab_burst",    "Burst Mode (93R)"),
     "panel_settings": ("btn_tab_settings", "Settings Panel"),
     "panel_overlay":  ("btn_tab_overlay",  "Overlay")
@@ -1890,6 +2114,7 @@ def build_tactical_surface():
                 dpg.add_text("  AimASSist", color=(145, 55, 240))
                 dpg.add_spacer(height=20)
                 dpg.add_button(tag="btn_tab_recoil",   width=145, height=35, callback=ui_tab_navigation, user_data="panel_recoil")
+                dpg.add_button(tag="btn_tab_linear", width=145, height=35, callback=ui_tab_navigation, user_data="panel_linear")
                 dpg.add_button(tag="btn_tab_burst",    width=145, height=35, callback=ui_tab_navigation, user_data="panel_burst")
                 dpg.add_button(tag="btn_tab_settings", width=145, height=35, callback=ui_tab_navigation, user_data="panel_settings")
                 dpg.add_button(tag="btn_tab_overlay",  width=145, height=35, callback=ui_tab_navigation, user_data="panel_overlay")
@@ -1898,7 +2123,9 @@ def build_tactical_surface():
                 dpg.add_separator()
                 dpg.add_text(" Mod links:")
                 dpg.add_checkbox(label="Recoil", default_value=True, tag="ui_toggle_recoil_mod",
-                                 callback=ui_thread_push_sync, user_data="recoil_module_enabled")
+                                 callback=callback_pattern_enabled, user_data="recoil_module_enabled")
+                dpg.add_checkbox(label="Linear", default_value=False, tag="ui_toggle_linear_mod",
+                                 callback=callback_linear_enabled)
                 dpg.add_checkbox(label="Burst",  default_value=True, tag="ui_toggle_burst_mod",
                                  callback=ui_thread_push_sync, user_data="burst_module_enabled")
                 dpg.add_spacer(height=20)
@@ -2067,6 +2294,41 @@ def build_tactical_surface():
                         dpg.add_button(label="-", width=24, callback=callback_zoom_out)
                         dpg.add_button(label="Fit", width=32, callback=callback_zoom_fit)
                         dpg.add_button(label="+", width=24, callback=callback_zoom_in)
+
+                with dpg.child_window(tag="panel_linear", width=-1, height=-1, border=False, show=False):
+                    dpg.add_text("Linear Workspace", color=(190, 120, 255))
+                    dpg.add_checkbox(label="Enable Linear", tag="ui_linear_enabled", callback=callback_linear_enabled)
+                    with dpg.group():
+                        dpg.add_text("MOVEMENT ENGINE", color=(190, 120, 255))
+                        dpg.add_input_text(default_value="Pattern", tag="ui_recoil_motion_mode", show=False)
+                        dpg.add_text("Movement only. Uses the Recoil trigger, ADS and safety controls.",
+                                     color=(140, 140, 150), wrap=570)
+                        with dpg.group(tag="linear_controls", show=True):
+                            dpg.add_spacer(height=8)
+                            dpg.add_combo(list(LINEAR_BEHAVIORS), width=260,
+                                          default_value="Single correction", tag="ui_linear_behavior",
+                                          callback=callback_linear_setting, user_data="linear_behavior")
+                            dpg.add_text("Single correction | counts/correction | X: left (-) / right (+), Y: up (-) / down (+)",
+                                         tag="linear_summary", wrap=570, color=(140, 140, 150))
+                            dpg.add_spacer(height=8)
+                            dpg.add_text("MOVEMENT", color=(190, 120, 255))
+                            for axis in ("x", "y"):
+                                key = "linear_" + axis
+                                dpg.add_slider_float(label=axis.upper() + " amount", width=420,
+                                                     min_value=-100.0, max_value=100.0, default_value=0.0,
+                                                     tag="ui_" + key, format="%.2f",
+                                                     callback=callback_linear_setting, user_data=key)
+                            dpg.add_text("Ctrl+click a slider to enter an exact value.", color=(140, 140, 150))
+                            dpg.add_spacer(height=8)
+                            dpg.add_text("TIMING", color=(190, 120, 255))
+                            for key, label in (("linear_delay_ms", "Start delay (ms)"),
+                                               ("linear_duration_ms", "Smooth duration (ms)"),
+                                               ("linear_cooldown_ms", "Retrigger cooldown (ms)"),
+                                               ("linear_interval_ms", "Repeat interval (ms)")):
+                                dpg.add_input_float(label=label, width=200, min_value=0.0, min_clamped=True,
+                                                    default_value=LINEAR_DEFAULTS[key], tag="ui_" + key,
+                                                    show=key not in ("linear_duration_ms", "linear_interval_ms"),
+                                                    callback=callback_linear_setting, user_data=key)
 
                 # ── BURST TAB ───────────────────────────────────────────
                 with dpg.child_window(tag="panel_burst", width=-1, height=-1, border=False):
